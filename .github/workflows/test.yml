@@ -482,7 +482,7 @@ jobs:
     name: ${{ matrix.name }}
     timeout-minutes: 60
     needs: [lint, changes]
-    if: needs.changes.outputs.chapter_matrix != '[]'
+    if: github.repository == 'stefan-jansen/machine-learning-for-trading' && needs.changes.outputs.chapter_matrix != '[]'
 
     strategy:
       fail-fast: false
@@ -548,7 +548,7 @@ jobs:
     name: cs-${{ matrix.case-study }}
     timeout-minutes: 90
     needs: [lint, changes]
-    if: needs.changes.outputs.case_matrix != '[]'
+    if: github.repository == 'stefan-jansen/machine-learning-for-trading' && needs.changes.outputs.case_matrix != '[]'
 
     strategy:
       fail-fast: false
@@ -607,7 +607,7 @@ jobs:
   test-py312:
     timeout-minutes: 45
     needs: [lint, changes]
-    if: needs.changes.outputs.run_py312 == 'true'
+    if: github.repository == 'stefan-jansen/machine-learning-for-trading' && needs.changes.outputs.run_py312 == 'true'
 
     runs-on: ubuntu-latest
     container:
@@ -646,7 +646,7 @@ jobs:
   test-neo4j:
     timeout-minutes: 30
     needs: [lint, changes]
-    if: needs.changes.outputs.run_neo4j == 'true'
+    if: github.repository == 'stefan-jansen/machine-learning-for-trading' && needs.changes.outputs.run_neo4j == 'true'
 
     runs-on: ubuntu-latest
     container:
@@ -703,7 +703,7 @@ jobs:
   test-benchmark:
     timeout-minutes: 30
     needs: [lint, changes]
-    if: needs.changes.outputs.run_benchmark == 'true'
+    if: github.repository == 'stefan-jansen/machine-learning-for-trading' && needs.changes.outputs.run_benchmark == 'true'
 
     runs-on: ubuntu-latest
     container:
