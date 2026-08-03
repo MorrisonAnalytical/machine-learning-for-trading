@@ -32,8 +32,9 @@ jobs:
   # ---------------------------------------------------------------------------
   chapters:
     if: >-
-      github.event.inputs.scope == 'all' ||
-      github.event.inputs.scope == 'chapters-only'
+      github.repository == 'stefan-jansen/machine-learning-for-trading' &&
+      (github.event.inputs.scope == 'all' ||
+      github.event.inputs.scope == 'chapters-only')
     timeout-minutes: 120
     runs-on: ubuntu-latest
     container:
@@ -81,8 +82,9 @@ jobs:
   # ---------------------------------------------------------------------------
   case-studies:
     if: >-
-      github.event.inputs.scope == 'all' ||
-      github.event.inputs.scope == 'case-studies-only'
+      github.repository == 'stefan-jansen/machine-learning-for-trading' &&
+      (github.event.inputs.scope == 'all' ||
+      github.event.inputs.scope == 'case-studies-only')
     timeout-minutes: 120
 
     strategy:
@@ -130,7 +132,7 @@ jobs:
   # Py312 notebooks (signatory, gensim, esig, pfhedge, tfcausalimpact, torch CUDA bug)
   # ---------------------------------------------------------------------------
   py312:
-    if: github.event.inputs.scope == 'all'
+    if: github.repository == 'stefan-jansen/machine-learning-for-trading' && github.event.inputs.scope == 'all'
     timeout-minutes: 45
     runs-on: ubuntu-latest
     container:
