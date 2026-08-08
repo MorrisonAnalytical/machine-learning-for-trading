@@ -6,7 +6,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.18.1
+#       jupytext_version: 1.19.3
 #   kernelspec:
 #     display_name: Python 3 (ipykernel)
 #     language: python
@@ -16,743 +16,831 @@
 # %% [markdown]
 # # S&P 500 Equity + Option Analytics: Feasibility Analysis
 #
-# This notebook tests whether the S&P 500 equity-with-option-analytics dataset can
-# deliver on the strategy declared in `config/setup.yaml`. `setup.yaml` is the
-# canonical, hand-curated source of truth: universe, costs, decision schedule,
-# mapping class, labels, sweep grid, and evaluation protocol. This notebook does
-# not write it. Instead, it produces the evidence that justifies its values:
-# options-coverage breadth per symbol, return distributions at daily and weekly
-# horizons relative to the 13 bps round-trip cost, autocorrelation support for
-# the weekly cadence, and a walk-forward fold demonstration. Findings persist to
-# `config/exploration/feasibility_report.json`.
+# Before building a trading strategy it is worth asking whether the data can support one at all.
+# This notebook does that and nothing else: it fits no model and makes no forecast.
 #
-# ## Learning Objectives
+# The strategy being checked is described in `config/setup.yaml`. Once a week it ranks S&P 500
+# constituents by a number read off their listed options, and buys the shares at the top of that
+# ranking. It holds shares, never options: the option market supplies the opinion, and the equity
+# market is where the position is taken. That file says which stocks it may hold, on which day of
+# the week it decides, what it assumes a trade costs, and how the history is divided between
+# designing the strategy and testing it. This notebook checks each of those assumptions against the
+# data and reports what it finds.
 #
-# - Verify options coverage delivers a usable universe (the analog to eligibility)
-# - Test whether typical equity moves exceed transaction costs at daily and weekly horizons
-# - Quantify return autocorrelation to support the weekly rebalance choice
-# - Demonstrate the walk-forward structure fits within the 2017–2021 sample
-# - Persist findings as a stable artifact downstream notebooks can cite
+# ## Learning objectives
 #
-# ## Book Reference
+# By the end of this notebook you will be able to:
 #
-# Chapter 6, Sections 6.2-6.6
+# - Read an implied volatility off an option surface summary, and find out what a dataset does
+#   with a calculation that failed before computing anything from the column
+# - Describe a universe of several hundred stocks by the property the strategy's cost model is
+#   sensitive to, rather than by counting its members
+# - Explain why the number of stocks carrying an option quote swings on a monthly cycle, from the
+#   expiration calendar rather than from anything the strategy does
+# - See why a charge quoted per share and a charge quoted as a percentage are different assumptions
+#   about friction, not two units for the same one
+# - Read off one chart what fraction of price moves are larger than the cost of trading them
+# - Measure how much of a ranking across stocks is left by the next decision date, computing the
+#   correlation between two orderings rather than inside a single stock's history
+# - Check that a walk-forward split fits the history available and leaves the test period unread
+#
+# ## Book reference
+#
+# Chapter 6, Sections 6.2-6.6. This notebook reads the daily implied volatility surface summary,
+# daily share prices and `config/setup.yaml`, and writes nothing.
 #
 # ## Prerequisites
 #
-# - S&P 500 options surface and daily-bars data available via the `data` package
-# - `config/setup.yaml` exists (canonical strategy spec)
-# - Understanding of walk-forward cross-validation (Section 6.5)
+# None beyond what the sections below define. A reader who has not traded an option will find the
+# instrument, its price and implied volatility explained where they are first used.
 
 # %%
-"""S&P 500 Equity + Option Analytics: Feasibility Analysis."""
+"""S&P 500 Equity + Option Analytics - Feasibility Analysis."""
 
-import json
+import datetime as dt
 import warnings
-from datetime import UTC, datetime
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-import seaborn as sns
 import yaml
-from scipy import stats
+from IPython.display import display
+from ml4t.diagnostic.splitters.calendar import TradingCalendar
 
+from case_studies.utils.feasibility import (
+    cross_sectional_persistence,
+    exceedance_curve,
+    fold_timeline,
+)
 from data import load_sp500_daily_bars, load_sp500_options_surface
+from utils.cv_splits import generate_cv_splits
 from utils.paths import get_case_study_dir
+from utils.style import COLORS, FIGSIZE, add_message_title
 
 warnings.filterwarnings("ignore")
-sns.set_style("whitegrid")
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
 START_DATE = "2017-01-01"
 END_DATE = "2021-12-31"
-MAX_SYMBOLS = 0
 
 # %% [markdown]
 # ## Configuration
+#
+# Everything the strategy assumes is declared in `config/setup.yaml`, and this notebook reads those
+# values rather than repeating them, so the two can never disagree. Four groups of settings matter
+# here, and each one decides something the sections below test.
+#
+# **How the history is divided.** The sample runs from the start of 2017 to the end of 2021. The
+# final year is the *holdout*: a stretch of history that is not looked at while the strategy is
+# being designed, so that when it is finally evaluated there, the result is not a rehearsal of
+# choices already tuned on the same data. Everything computed in this notebook uses the earlier
+# part, called the development period, and `evaluation.holdout_start` is where the line falls.
+#
+# **What the strategy ranks, and what it holds.** The ranking is built from one column of the
+# option surface summary, the thirty-day at-the-money implied volatility that Section A defines,
+# and `features.surface` records the contracts it is selected from. A stock is available to rank on
+# a date only where that number exists for it, which is not every date. From the ranking the
+# strategy holds the leading names, at most `backtest.sweep.top_k_grid` of them, so that count is
+# the floor the universe has to clear on a decision date and Section B.2 counts against it.
+#
+# **What a trade is assumed to cost.** `costs.model` declares a percentage regime: one round-trip
+# charge in basis points, the same for every stock whatever it costs per share. A basis point is
+# one hundredth of one percent. Alongside it the sweep carries a per-share regime, where the charge
+# is a commission plus a half-spread quoted in cents and the percentage follows from the share
+# price. Section B.3 measures how far apart the two are across this universe.
+#
+# **What is being predicted, and how it is evaluated.** `labels.primary` names the forward share
+# return the strategy is trying to rank stocks by, and `labels.horizons` gives every holding period
+# the design considers. Because a position opened on one decision date is still open on the next,
+# `labels.buffer` is the separation a walk-forward split has to leave between training and
+# validation, and Section D reads it.
 
 # %%
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
-CASE_DIR.mkdir(parents=True, exist_ok=True)
-EXPLORATION_DIR = CASE_DIR / "config" / "exploration"
-EXPLORATION_DIR.mkdir(parents=True, exist_ok=True)
+SETUP = yaml.safe_load((CASE_DIR / "config" / "setup.yaml").read_text())
 
-with open(CASE_DIR / "config" / "setup.yaml") as f:
-    SETUP = yaml.safe_load(f)
-
-STRATEGY_ID = SETUP["strategy_id"]
 HOLDOUT_START = str(SETUP["evaluation"]["holdout_start"])
 HOLDOUT_END = str(SETUP["evaluation"]["holdout_end"])
-ROUND_TRIP_COST_BPS = int(SETUP["costs"]["round_trip_cost_bps"])
-ROUND_TRIP_COST = ROUND_TRIP_COST_BPS / 10_000  # 13 bps -> 0.0013
+PRIMARY_LABEL = SETUP["labels"]["primary"]
+LABEL_BUFFER = SETUP["labels"]["buffer"]
+BUFFER_SESSIONS = int(LABEL_BUFFER.rstrip("D"))
+HORIZONS = sorted({int(h.rstrip("D")) for h in SETUP["labels"]["horizons"].values()})
+BREADTH_FLOOR = max(SETUP["backtest"]["sweep"]["top_k_grid"][PRIMARY_LABEL])
+COST_BPS = SETUP["costs"]["round_trip_cost_bps"]
+PER_SHARE = SETUP["costs"]["per_share"]
+HALF_SPREADS = SETUP["backtest"]["sweep"]["cost_grid_half_spread_usd"]
+ATM_IV = "iv_30_atm"
+DTE_LOW, DTE_HIGH = SETUP["features"]["surface"]["dte_buckets"]["30d"]
+IV_LAG = int(SETUP["decision"]["iv_feature_lag"].split("_")[0])
+IV_STALE = SETUP["features"]["windows"]["iv_forward_fill"]
+CALENDAR = TradingCalendar(SETUP["evaluation"]["calendar"])
+SESSIONS = CALENDAR.trading_days_between(START_DATE, HOLDOUT_START)
+# Persistence is read in decision dates rather than sessions, so the ordering is compared against
+# the next decision the strategy takes. Two months of them is long enough to see it flatten.
+PERSISTENCE_WEEKS = 8
 
-
-def _expected_trading_days(start_date: str, end_date: str) -> int:
-    """Approximate NYSE trading days between two ISO dates (~252/365)."""
-    start = datetime.fromisoformat(start_date)
-    end = datetime.fromisoformat(end_date)
-    calendar_days = (end - start).days
-    return int(calendar_days * 252 / 365)
-
+print(f"Sample: {START_DATE} to {END_DATE}")
+print(f"  Development period, used everywhere below:  {START_DATE} to {HOLDOUT_START}")
+print(f"  Holdout, not read by this notebook:         {HOLDOUT_START} to {HOLDOUT_END}")
+print(
+    f"Ranked on: {ATM_IV}, the at-the-money implied volatility of contracts maturing in "
+    f"{DTE_LOW} to {DTE_HIGH} days, read {IV_LAG} session late and carried at most {IV_STALE}"
+)
+print(
+    f"Universe: {SETUP['universe']['n_assets']} constituents under "
+    f"{SETUP['universe']['eligibility_rule']}, of which the strategy holds up to {BREADTH_FLOOR}"
+)
+print(
+    f"Assumed cost: {SETUP['costs']['model']} regime, {COST_BPS} bps a round trip, against a "
+    f"per-share companion of {PER_SHARE} commission plus a half-spread from "
+    f"{min(HALF_SPREADS)} to {max(HALF_SPREADS)} dollars"
+)
+print(
+    f"Prediction: {PRIMARY_LABEL}, over horizons of {HORIZONS} sessions, decided at the "
+    f"{SETUP['decision']['snapshot']} snapshot and executed at the "
+    f"{SETUP['decision']['execution_delay']}"
+)
+print(
+    f"Walk-forward: {SETUP['evaluation']['n_splits']} folds on the "
+    f"{SETUP['evaluation']['calendar']} calendar, with {BUFFER_SESSIONS} sessions of separation "
+    f"between training and validation"
+)
 
 # %% [markdown]
-# ---
+# ## A. Orientation
 #
-# ## Section A: Orientation (Section 6.2)
+# ### What the option market is being asked
 #
-# This case study trades S&P 500 underlying equities using features derived from
-# the listed-options market: implied-volatility level and dynamics, skew, term
-# structure, and the variance-risk-premium gap between IV and realized vol.
-# Options provide the *features*; the strategy holds the *underlying stocks*.
-# Decisions are made at Friday close and executed at Monday open, with a one-day
-# publication lag on IV features to keep the protocol point-in-time.
+# An option is a contract on a stock. A **call** gives its holder the right to buy the stock at a
+# fixed price, the **strike**, up to a fixed date, the **expiration**; a **put** gives the right to
+# sell it on the same terms. The holder pays for that right, and the amount paid is the
+# **premium**. A contract whose strike sits nearest the current share price is **at the money**.
 #
-# `setup.yaml` declares the trading setup. This notebook asks whether the data
-# delivers on those declarations:
+# What a contract is worth depends above all on how far the market expects the stock to travel
+# before it expires. So the traded premium implies a movement, which is quoted the way
+# statisticians quote one: as an annualized standard deviation of returns. That number is the
+# **implied volatility**. It is not a price the exchange publishes; it is solved for, by asking
+# what volatility would make a pricing model return the premium the contract actually trades at.
+# Solving can fail, on a contract that has barely traded or whose quotes are crossed, and the
+# vendor records the failure rather than dropping the row. Section B.1 is where that is handled.
 #
-# - **Universe**: Is options coverage adequate across the 2017–2021 sample?
-# - **Costs**: Do typical equity moves exceed the 13 bps round-trip cost at
-#   daily / weekly horizons?
-# - **Cadence**: Does the autocorrelation profile support weekly rebalancing?
-# - **Evaluation**: Do walk-forward folds fit within the 5-year sample and stay
-#   clear of the 2021 holdout?
+# ### The one number this strategy reads
+#
+# A stock has hundreds of listed contracts at any moment, at many strikes and expirations, so a
+# strategy that wants one number per stock per day has to say which. `features.surface` says: take
+# the contracts maturing inside the declared day range, take the call and the put nearest the
+# money, and average their implied volatilities. `materialize_options.py` does that once for the
+# whole market and writes the daily surface summary this notebook loads. A stock therefore has a
+# value on a date only if it had a listed expiration inside that maturity window, which is a
+# property of the option listing calendar rather than of the stock, and Section B.2 is about what
+# that does to the universe.
+#
+# ### What the strategy does with it
+#
+# It ranks the stocks by that number and buys the shares of the ones at the top, in equal weights,
+# holding until the next weekly decision. It never holds an option. Two consequences run through
+# everything below. Every cost is an ordinary equity trading cost, charged on the share price, not
+# an option cost charged on a premium. And there is nothing to hedge: a share position's exposure
+# to the share price is the position, not a side effect of it.
+#
+# ### The three questions this notebook asks
+#
+# 1. **Does the universe exist when the strategy acts?** Decisions are taken once a week, and a
+#    stock can be ranked only where the option market gave it a value, so enough stocks have to
+#    carry one on each of those dates to fill the book.
+# 2. **Is a typical move in the share price worth more than it costs to trade?** The declared
+#    percentage cost charges every stock alike; a per-share charge does not, and the universe runs
+#    from a few dollars a share to well over a thousand.
+# 3. **Is there enough history to evaluate this honestly?** Enough to split into training and
+#    validation periods more than once, with the holdout left untouched, and with a gap wide enough
+#    that a position opened in training does not resolve inside validation.
 
 # %% [markdown]
-# ---
+# ## B. Universe and cost feasibility
 #
-# ## Section B: Universe and Cost Feasibility (Sections 6.3-6.4)
-
-# %% [markdown]
-# ### B.1 Load and Verify Data
+# ### B.1 Load the data and look at the universe
 #
-# We load both the options surface (for coverage analysis) and daily equity bars
-# (for return-cost feasibility). The options surface is the binding constraint:
-# the universe is "S&P 500 constituents *with* options coverage."
+# Two files are loaded: the surface summary, one row per stock and session, and daily share prices.
+#
+# One property of the implied volatility decides how it may be used. Where the solve described in
+# Section A did not converge, the vendor records the failure as a negative number rather than as an
+# empty field, and a difference or ratio taken across tenors inherits it. A negative annualized
+# standard deviation is not a quantity, and it is worse than a missing one: a drop-missing leaves
+# it in place, and in a ranking it sorts that stock to the bottom on the strength of a solver
+# failure rather than a cheap option. `load_sp500_options_surface` returns those placeholders as
+# missing values, along with every surface measure derived from one, so that this notebook and
+# every later stage see the same thing. The count of stock-sessions with no value is reported
+# below; the assertion states the invariant the loader is there to give.
+#
+# The other assertion is that the summary holds at most one row per stock and session, since a
+# second would double that stock's weight in every average taken across the panel.
 
 # %%
 surface = load_sp500_options_surface(start_date=START_DATE, end_date=END_DATE)
-sp500_bars = load_sp500_daily_bars(start_date=START_DATE, end_date=END_DATE)
+bars = load_sp500_daily_bars(start_date=START_DATE, end_date=END_DATE)
+development = pl.col("timestamp") < pl.lit(HOLDOUT_START).str.to_date()
+quotes = bars.filter(development).select("timestamp", "symbol", "sec_id", "close", "adj_factor")
+summary = surface.filter(development)
 
-print(
-    f"Options surface: {surface.height:,} rows, "
-    f"{surface['symbol'].n_unique()} symbols, "
-    f"{surface['timestamp'].n_unique()} distinct dates"
+assert not summary.select(pl.struct("symbol", "timestamp").is_duplicated().any()).item(), (
+    "a stock carries more than one surface row on a session"
 )
-print(f"Equity bars:     {sp500_bars.height:,} rows, {sp500_bars['symbol'].n_unique()} symbols")
+assert summary.select((pl.col(ATM_IV).drop_nulls() > 0).all()).item(), (
+    "an implied volatility that is present is not positive"
+)
+
+solved = summary.select("timestamp", "symbol", ATM_IV).drop_nulls(ATM_IV)
+panel = solved.join(quotes.drop("sec_id"), ["timestamp", "symbol"]).sort(["symbol", "timestamp"])
+print(
+    f"{panel['symbol'].n_unique()} stocks, {len(panel):,} stock-sessions over "
+    f"{panel['timestamp'].n_unique():,} sessions, {panel['timestamp'].min()} to "
+    f"{panel['timestamp'].max()}\n"
+    f"{summary[ATM_IV].null_count():,} of {len(summary):,} surface rows carry no implied "
+    f"volatility, whether unquoted or unsolved"
+)
 
 # %% [markdown]
-# ### B.2 Universe: Options-Coverage Diagnostic
+# Six hundred tickers are a list, not a description. The property to sort them by here is the share
+# price, because Section B.3's subject is that a charge quoted in cents per share and a charge
+# quoted as a percentage of the trade rank this universe differently, and the price is what
+# separates them. The table below cuts the universe at fifty, one hundred and two hundred and fifty
+# dollars a share and reports what each group looks like.
 #
-# Unlike ETF case studies where the binding filter is dollar volume, here the
-# relevant filter is *options-data availability*. We compute per-symbol coverage
-# against the *expected* number of NYSE trading days in the sample (not against
-# the dates actually present in the surface, which may have vendor gaps).
-#
-# Coverage is reported as a *diagnostic* — `setup.yaml::universe.n_assets`
-# records the full surface universe, and per-date missingness is handled
-# downstream by feature-level NaN dropping in the modeling notebooks rather than
-# by a universe-level pre-filter. The 90% line below marks the symbols with
-# near-complete histories; symbols below it still contribute on the dates where
-# they have features.
+# Three things to read off it. The price range across the whole universe spans nearly three orders
+# of magnitude, which is what makes a fixed charge per share a very different assumption at one end
+# than at the other. Implied volatility is not ordered by price: the cheapest group and the dearest
+# group are the two most volatile, so a cost model built on the price is not quietly selecting on
+# how much the stock moves. And no group is quotable on more than about half the sessions in the
+# period, which is the listing cycle Section B.2 takes up.
 
 # %%
-expected_trading_days = _expected_trading_days(START_DATE, END_DATE)
-actual_dates_in_data = surface["timestamp"].n_unique()
+PRICE_CUTS = [50, 100, 250]
+band = pl.col("price")
+label = pl.when(band < PRICE_CUTS[0]).then(pl.lit(f"under {PRICE_CUTS[0]}"))
+for low, high in zip(PRICE_CUTS, PRICE_CUTS[1:], strict=False):
+    label = label.when(band < high).then(pl.lit(f"{low} to {high}"))
+label = label.otherwise(pl.lit(f"{PRICE_CUTS[-1]} and over"))
 
-coverage = (
-    surface.group_by("symbol")
-    .agg(pl.col("timestamp").n_unique().alias("n_days"))
-    .with_columns((pl.col("n_days") / expected_trading_days).alias("coverage"))
-    .sort("coverage", descending=True)
+n_sessions = quotes["timestamp"].n_unique()
+by_symbol = panel.group_by("symbol").agg(
+    pl.col("close").median().alias("price"),
+    (pl.col(ATM_IV) * 100).median().alias("implied_vol"),
+    pl.len().alias("stock_sessions"),
 )
-
-COVERAGE_THRESHOLD = 0.90
-n_symbols = coverage.height
-n_above_threshold = int((coverage["coverage"] >= COVERAGE_THRESHOLD).sum())
-median_coverage = float(coverage["coverage"].median())
-min_coverage = float(coverage["coverage"].min())
-
-print(f"Expected trading days:  {expected_trading_days}")
+groups = (
+    by_symbol.with_columns(label.alias("share_price"))
+    .group_by("share_price")
+    .agg(
+        pl.len().alias("stocks"),
+        pl.col("price").median().round(0).alias("median_price"),
+        pl.col("implied_vol").median().round(1).alias("median_implied_vol_pct"),
+        (pl.col("stock_sessions").median() / n_sessions * 100).round(0).alias("pct_of_sessions"),
+        pl.col("stock_sessions").sum().alias("stock_sessions"),
+    )
+    .sort("median_price")
+)
+with pl.Config(tbl_rows=groups.height, tbl_cols=groups.width):
+    display(groups)
 print(
-    f"Actual dates in data:   {actual_dates_in_data} "
-    f"(diff={abs(expected_trading_days - actual_dates_in_data)})"
+    f"Share price across the universe {by_symbol['price'].min():.2f} to "
+    f"{by_symbol['price'].max():.2f}, over {n_sessions:,} sessions"
 )
-print(f"Symbols with options:   {n_symbols}")
-print(f"Median symbol coverage: {median_coverage:.1%}")
-print(f"Min symbol coverage:    {min_coverage:.1%}")
-print(f"Symbols >= {COVERAGE_THRESHOLD:.0%} coverage: {n_above_threshold}")
 
 # %% [markdown]
-# #### Coverage Distribution
+# ### B.2 How many stocks can be ranked when the strategy decides
 #
-# The histogram below shows the per-symbol coverage distribution. The 90%
-# reference line is a diagnostic anchor — the universe is not trimmed to it.
-# Per-date NaN handling in the feature/modeling stages decides on each
-# decision date which symbols contribute.
+# `setup.yaml::decision.cadence` decides at the last close of each week, so that is where the
+# universe has to exist. A stock counts on that date under the delay the design assumes: the
+# surface summary describes the close it is stamped at and is not read until the next session, and
+# `03_financial_features` carries a value forward over a short gap, so the count below applies that
+# lag and that tolerance first. Both are declared in sessions, and the summary skips the sessions a
+# stock had no surface point on, so the panel is placed on the trading calendar before either is
+# applied. On a row-counted lag, a month-old value reads as one session late.
+#
+# The count swings, and the reason is the option listing calendar rather than anything about the
+# stocks. Every optionable US stock has **monthly** expirations, one in the third week of each
+# month, on the third Friday or on the session before it when that Friday is a market holiday.
+# Liquid names additionally have **weekly** expirations on most other Fridays. A stock enters the
+# summary on a session only if one of its expirations falls inside the maturity window, so on the
+# sessions when a monthly expiration is inside that window the whole universe qualifies, and on
+# the rest only the names carrying weeklies do. The figure separates the decision dates on that
+# basis, asking the question of the session the value was stamped on rather than of the decision
+# date, because those are one session apart and the answer differs between them.
+#
+# The maturity window is eleven calendar days wide and a monthly expiration arrives once a month,
+# so at most one can be inside the window at a time, which the assertion states.
 
 # %%
-fig, ax = plt.subplots(figsize=(8, 4))
-ax.hist(coverage["coverage"].to_numpy(), bins=40, color="#606060", edgecolor="white")
-ax.axvline(
-    COVERAGE_THRESHOLD,
-    color="black",
-    linestyle="--",
-    linewidth=2,
-    label=f"{COVERAGE_THRESHOLD:.0%} threshold",
+sessions = bars["timestamp"].unique().sort().to_list()
+last_session = max(s for s in sessions if s < dt.date.fromisoformat(HOLDOUT_START))
+
+
+def _monthly_expirations(first: dt.date, last: dt.date) -> set[dt.date]:
+    """Third-week expirations, moved back to the previous session on a market holiday."""
+    trading = set(sessions)
+    dates, day = set(), first
+    while day <= last:
+        if day.weekday() == 4 and 15 <= day.day <= 21:
+            expiry = day
+            while expiry not in trading and expiry <= last_session:
+                expiry -= dt.timedelta(days=1)
+            dates.add(expiry)
+        day += dt.timedelta(days=1)
+    return dates
+
+
+monthlies = _monthly_expirations(
+    dt.date.fromisoformat(START_DATE), last_session + dt.timedelta(days=DTE_HIGH)
 )
-ax.set_xlabel("Coverage Fraction (n_days / expected_trading_days)")
-ax.set_ylabel("Number of Symbols")
-ax.set_title(
-    f"{n_above_threshold} of {n_symbols} S&P 500 names clear "
-    f"{COVERAGE_THRESHOLD:.0%} options coverage"
+in_window = {
+    day
+    for day in sessions
+    if any(day + dt.timedelta(days=k) in monthlies for k in range(DTE_LOW, DTE_HIGH + 1))
+}
+# The value read at a decision was stamped IV_LAG sessions earlier, so the listing question is
+# about that session rather than about the decision date, and the flag is carried forward with it.
+listings = (
+    pl.DataFrame({"timestamp": sessions})
+    .sort("timestamp")
+    .with_columns(pl.col("timestamp").is_in(in_window).shift(IV_LAG).alias("monthly_in_window"))
+    .drop_nulls("monthly_in_window")
 )
-ax.legend(loc="upper left")
-sns.despine()
-fig.tight_layout()
+assert len({(d.year, d.month) for d in monthlies}) == len(monthlies), (
+    "two monthly expirations fall in the same month"
+)
+
+
+# %% [markdown]
+# The summary carries a row only where a stock had a surface point, so it is not a complete grid:
+# a stock's rows skip whole weeks. Both `iv_feature_lag` and `iv_forward_fill` are declared in
+# sessions, so the panel is placed on the session grid before either is applied. Shifting the rows
+# as they come would read "one session late" off a value up to a month old, and would spend the
+# five-session tolerance on five rows that can span far more than five sessions.
+
+# %%
+grid = (
+    summary.select("symbol")
+    .unique()
+    .join(quotes.select("timestamp").unique(), how="cross")
+    .join(summary.select("timestamp", "symbol", ATM_IV), on=["timestamp", "symbol"], how="left")
+)
+rankable = (
+    grid.sort(["symbol", "timestamp"])
+    .with_columns(pl.col(ATM_IV).shift(IV_LAG).forward_fill(limit=IV_STALE).over("symbol"))
+    .drop_nulls(ATM_IV)
+    .join(quotes.select("timestamp", "symbol"), ["timestamp", "symbol"])
+)
+decisions = rankable.group_by(pl.col("timestamp").dt.truncate("1w")).agg(
+    pl.col("timestamp").max().alias("decision_date")
+)
+entries = rankable.join(decisions, left_on="timestamp", right_on="decision_date").join(
+    listings, on="timestamp"
+)
+# Whether a monthly expiration is in the maturity window is a property of the date rather than of
+# the stock, so the two groups are two sets of decision dates, not two parts of one count.
+breadth = (
+    entries.group_by("timestamp")
+    .agg(
+        pl.col("symbol").n_unique().alias("n_stocks"),
+        pl.col("monthly_in_window").first(),
+    )
+    .sort("timestamp")
+)
+
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+ax.plot(breadth["timestamp"], breadth["n_stocks"], color=COLORS["silver_muted"], lw=0.6, zorder=1)
+for monthly, color, name in (
+    (False, COLORS["blue"], "only weekly expirations in the window"),
+    (True, COLORS["amber"], "a monthly expiration in the window"),
+):
+    group = breadth.filter(pl.col("monthly_in_window") == monthly)
+    ax.scatter(group["timestamp"], group["n_stocks"], s=9, color=color, label=name, zorder=2)
+ax.axhline(
+    BREADTH_FLOOR, color=COLORS["copper"], ls="--", lw=1.5, label="stocks the book has to fill"
+)
+ax.set_ylim(0, SETUP["universe"]["n_assets"])
+ax.set_ylabel("Stocks that can be ranked")
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.legend(frameon=False, fontsize=8, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.14))
+add_message_title(
+    ax,
+    "The universe doubles on the dates a monthly expiration is in reach",
+    subtitle="Stocks with a lagged implied volatility and a share price, at each weekly decision",
+)
 plt.show()
 
 # %% [markdown]
-# **Interpretation**: Coverage is heterogeneous — many symbols have partial
-# histories because of intermittent vendor data or mid-sample S&P 500
-# inclusion/exclusion. `setup.yaml::universe.n_assets` records the full surface
-# universe; downstream feature and modeling code drops per-date NaNs so symbols
-# contribute only on dates where their features are observed.
-
-# %% [markdown]
-# ### B.3 Trading-Cost Analysis: Horizon Feasibility
+# Breadth never approaches the floor, so it is not what limits this strategy. What the swing
+# changes is *which* stocks can be ranked. On the narrow dates the cross-section is about half the
+# universe and the half that disappears is the less liquid half, so a statistic averaged over
+# decision dates is an average over two different universes, and the carry-forward tolerance does
+# not close the gap because the narrow stretches run longer than it does.
 #
-# The strategy trades the underlying equities (not options), so the relevant
-# cost reference is equity execution: 3–10 bps per leg, i.e., 13 bps round-trip
-# at the midpoint (6.5 bps × 2 legs). We check whether typical absolute moves
-# at daily and weekly horizons exceed this floor.
+# ### B.3 What a trade costs, and what a move is worth
+#
+# `setup.yaml::costs.model` declares a percentage regime: one round trip in basis points, charged
+# alike on every stock. The companion the sweep keeps is a per-share regime, where the charge is a
+# commission plus a half-spread quoted in cents, so the percentage it works out to depends on the
+# share price, and a cent is a far larger fraction of a cheap share than of an expensive one.
+#
+# The curve below states the per-share regime in the percentage regime's units, one point per
+# stock, ordered by share price. The band spans the declared half-spread grid from its cheapest
+# rung, which charges commission alone, to its dearest. The flat line is what the percentage regime
+# charges the same stock. Nominal quoted prices are used, not prices adjusted for splits and
+# dividends: a commission is charged on the price a share actually traded at.
 
 # %%
-daily_returns = (
-    sp500_bars.sort(["symbol", "timestamp"])
-    .with_columns((pl.col("close") / pl.col("close").shift(1) - 1).over("symbol").alias("return"))
-    .filter(pl.col("return").is_not_null())
+prices = (
+    quotes.join(panel.select("symbol").unique(), on="symbol")
+    .with_columns((pl.col("close") * pl.col("adj_factor")).alias("adjusted"))
+    .sort(["symbol", "sec_id", "timestamp"])
+)
+cost = (
+    prices.group_by("symbol")
+    .agg(pl.col("close").median().alias("price"))
+    .with_columns(
+        (2 * (min(HALF_SPREADS) + PER_SHARE) / pl.col("price") * 1e4).alias("cheapest"),
+        (2 * (max(HALF_SPREADS) + PER_SHARE) / pl.col("price") * 1e4).alias("dearest"),
+    )
+    .sort("price", descending=True)
 )
 
-weekly_bars = (
-    sp500_bars.with_columns(pl.col("timestamp").dt.strftime("%G-W%V").alias("week"))
-    .group_by(["symbol", "week"])
-    .agg(pl.col("close").last().alias("close"), pl.col("timestamp").max().alias("timestamp"))
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+rank = np.arange(len(cost))
+ax.fill_between(rank, cost["cheapest"], cost["dearest"], color=COLORS["blue"], alpha=0.25)
+ax.plot(rank, cost["cheapest"], color=COLORS["blue"], lw=1.2, label="commission only")
+ax.plot(rank, cost["dearest"], color=COLORS["amber"], lw=1.2, label="widest declared half-spread")
+ax.axhline(COST_BPS, color=COLORS["copper"], ls="--", lw=1.5, label="declared percentage cost")
+ax.set_yscale("log")
+ax.set_xlabel("Stocks, ordered from the highest share price to the lowest")
+ax.set_ylabel("Round-trip cost (bps of the share price, log scale)")
+ax.legend(frameon=False, fontsize=8, loc="upper left")
+add_message_title(
+    ax,
+    "A per-share charge costs low-priced stocks orders of magnitude more",
+    subtitle="Declared commission and half-spread over each stock's median quoted price",
+)
+plt.show()
+
+# %% [markdown]
+# The band crosses the flat line rather than sitting to one side of it, so no single figure in
+# cents reproduces the percentage regime across a universe this wide in price. That is why the
+# percentage regime is the headline and the per-share regime is carried as a companion: the two are
+# different assumptions about what friction is, and Chapter 18 sweeps both rather than choosing.
+#
+# Against that cost sits the move in the share price itself. Returns run close to close on the
+# split- and dividend-adjusted series, and inside one security identity, so that a split does not
+# enter as a return and a ticker changing hands between two companies does not either. They are
+# measured over the stock-sessions the strategy could have ranked, which is the population the
+# question is about: a move in a stock the strategy could not have held that day is not an
+# opportunity it passed up.
+#
+# The chart is an **exceedance curve**, and it reads from the right: for each magnitude on the
+# horizontal axis it gives the fraction of moves at least that large. Where it crosses the cost
+# line is the fraction of moves bigger than what it costs to trade them. One thing it is not: it
+# ignores direction entirely, so it is the distribution of how far the share travels, not the
+# return the strategy would earn. Whether the ranking picks the stocks that travel upward is the
+# question Chapter 7 onward asks.
+
+# %%
+returns = (
+    prices.with_columns(
+        (pl.col("adjusted").pct_change(h).abs().over(["symbol", "sec_id"]) * 1e4).alias(f"h{h}")
+        for h in HORIZONS
+    )
+    .join(rankable.select("timestamp", "symbol"), ["timestamp", "symbol"])
     .sort(["symbol", "timestamp"])
 )
-weekly_returns = weekly_bars.with_columns(
-    (pl.col("close") / pl.col("close").shift(1) - 1).over("symbol").alias("return")
-).filter(pl.col("return").is_not_null())
 
-daily_abs = daily_returns["return"].abs().to_numpy()
-weekly_abs = weekly_returns["return"].abs().to_numpy()
-
-print(f"Daily returns:  {len(daily_abs):,} observations")
-print(f"Weekly returns: {len(weekly_abs):,} observations")
-
-# %% [markdown]
-# #### Return Distributions Relative to the Cost Floor
-
-# %%
-fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
-horizons = [("Daily", daily_abs, "#404040"), ("Weekly", weekly_abs, "#808080")]
-
-for ax, (label, data, color) in zip(axes, horizons, strict=False):
-    data_clipped = data[data < 0.10]
-    ax.hist(data_clipped, bins=50, density=True, alpha=0.5, color=color, edgecolor="white")
-    if len(data_clipped) > 100:
-        kde = stats.gaussian_kde(data_clipped, bw_method=0.1)
-        grid = np.linspace(0, 0.08, 200)
-        ax.plot(grid, kde(grid), color=color, linewidth=2, label=f"{label} KDE")
-    ax.axvline(
-        ROUND_TRIP_COST,
-        color="black",
-        linestyle="--",
-        linewidth=2,
-        label=f"Cost: {ROUND_TRIP_COST_BPS} bps",
-    )
-    frac_above = (data > ROUND_TRIP_COST).mean()
-    median_val = float(np.median(data))
-    stats_text = f"Median: {median_val * 100:.2f}%\n{frac_above:.0%} > cost"
-    # Place the stat box in the empty right tail, clear of the upper-right legend.
-    ax.text(
-        0.97,
-        0.55,
-        stats_text,
-        transform=ax.transAxes,
-        ha="right",
-        va="center",
-        fontsize=10,
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-    )
-    ax.set_title(f"{label} Horizon")
-    ax.set_xlabel("Absolute Return")
-    ax.set_xlim(0, 0.08)
-    ax.legend(loc="upper right", fontsize=9)
-
-axes[0].set_ylabel("Density")
-frac_weekly_above = (weekly_abs > ROUND_TRIP_COST).mean()
-fig.suptitle(
-    f"Weekly S&P 500 moves clear the {ROUND_TRIP_COST_BPS} bps cost floor "
-    f"{frac_weekly_above:.0%} of the time",
-    fontsize=12,
-    fontweight="bold",
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+for h, color in zip(HORIZONS, (COLORS["blue"], COLORS["amber"]), strict=True):
+    magnitude, fraction = exceedance_curve(returns[f"h{h}"].drop_nulls().to_numpy())
+    ax.plot(magnitude, fraction, color=color, lw=1.6, label=f"{h}-session move")
+ax.axvline(COST_BPS, color=COLORS["copper"], ls="--", lw=1.5, label="declared round trip")
+ax.set_xscale("log")
+ax.set_xlim(1, 20_000)
+ax.set_xlabel("Absolute move (bps, log scale)")
+ax.set_ylabel("Fraction of moves at least this large")
+ax.legend(frameon=False, fontsize=8, loc="lower left")
+add_message_title(
+    ax,
+    "Moves at both horizons clear the declared round trip almost always",
+    subtitle="Exceedance of absolute adjusted returns over the stock-sessions that can be ranked",
 )
-sns.despine()
-fig.tight_layout()
 plt.show()
 
 # %% [markdown]
-# #### Cost-Exceedance Summary
+# ### B.4 How much of the ranking is left at the next decision
+#
+# Re-ranking every week is worth the trading it causes only if what the data says on one decision
+# date still says something on the next. `mapping.entry_logic` acts on a stock's *place* in the
+# cross-section rather than on its implied volatility as a level, and the two are not the same
+# thing: every stock's volatility can rise together while the ordering among them is untouched.
+# So the quantity to measure is the ordering.
+#
+# The measurement builds the ranking on one decision date, builds it again some number of decision
+# dates later, and correlates the two over the stocks present on both. Plotted against that number
+# of weeks, it shows how much of an ordering is still in place and how quickly the rest is
+# replaced.
+#
+# It is computed this way, rather than by correlating each stock's own history against itself, for
+# a reason Section B.2 supplies. A correlation inside a stock needs that stock quoted without
+# interruption, and here more than two thirds of the universe is missing from the summary on the
+# narrow dates, so that form would answer the question for the always-quoting minority and discard
+# everyone the listing cycle actually affects. Comparing two orderings uses whichever stocks are
+# present on both dates and excludes nobody permanently. The shaded region shows how much the
+# result varies from one pair of dates to another, and the band around zero shows how large a
+# correlation could plausibly get between two unrelated orderings of this many stocks.
 
 # %%
-COST_THRESHOLDS_BPS = [5, 10, 15, 20, 30]
-cost_rows = []
-for horizon_label, data in [("Daily", daily_abs), ("Weekly", weekly_abs)]:
-    row = {"horizon": horizon_label}
-    for cost_bps in COST_THRESHOLDS_BPS:
-        row[f"{cost_bps}_bps"] = float((data > cost_bps / 10_000).mean() * 100)
-    cost_rows.append(row)
-
-cost_df = pl.DataFrame(cost_rows)
-cost_df.select(
-    [
-        "horizon",
-        pl.col("5_bps").round(1).alias("5 bps %"),
-        pl.col("10_bps").round(1).alias("10 bps %"),
-        pl.col("15_bps").round(1).alias("15 bps %"),
-        pl.col("20_bps").round(1).alias("20 bps %"),
-        pl.col("30_bps").round(1).alias("30 bps %"),
-    ]
+persistence = cross_sectional_persistence(
+    entries,
+    time_col="timestamp",
+    entity_col="symbol",
+    value_col=ATM_IV,
+    max_lags=PERSISTENCE_WEEKS,
 )
 
-# %% [markdown]
-# **Interpretation**: For large-cap S&P 500 names, both daily and weekly moves
-# comfortably clear the 13 bps round-trip floor in the vast majority of
-# observations. Friction is *not* the binding constraint for this universe; the
-# binding constraint is feature latency (the 1-day IV publication lag) and signal
-# persistence at the chosen cadence.
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+ax.axhspan(
+    -persistence["band"][0],
+    persistence["band"][0],
+    color=COLORS["copper"],
+    alpha=0.3,
+    zorder=1,
+    label="range expected from unrelated orderings",
+)
+ax.fill_between(
+    persistence["lag"],
+    persistence["rho_p10"],
+    persistence["rho_p90"],
+    color=COLORS["blue"],
+    alpha=0.15,
+    zorder=2,
+    label="10th to 90th percentile across pairs of dates",
+)
+ax.plot(
+    persistence["lag"],
+    persistence["rho"],
+    color=COLORS["blue"],
+    lw=1.6,
+    marker="o",
+    ms=4,
+    zorder=3,
+    label="average across pairs of dates",
+)
+ax.set_ylim(0, 1.02)
+ax.set_xticks(persistence["lag"].to_list())
+ax.set_xlabel("Decision dates between the two rankings")
+ax.set_ylabel("Correlation between the two orderings")
+ax.legend(frameon=False, fontsize=8, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.16))
+add_message_title(
+    ax,
+    "Most of the ranking is still there a week later",
+    subtitle="Correlation of the implied volatility ordering between decision dates",
+)
+plt.show()
 
 # %% [markdown]
-# #### Cost-Regime Choice: bps Headline, per-Share Exploratory
+# ### B.5 Move size against cost
 #
-# `setup.yaml::costs.model = percentage` — costs are declared in basis points
-# rather than a flat $/share half-spread. S&P 500 constituents are liquid
-# large-caps with a relatively narrow price distribution ($50–$500 nominal
-# range in the validation window), so bps and per-share regimes track each
-# other closely here. The decisive consideration is that prices in this
-# panel are split-adjusted: a $0.01 half-spread on a $50 split-adjusted
-# share quotes a different bps friction than the same $0.01 on the
-# unadjusted share that actually traded. A flat-default per-share cost
-# applied to adjusted historical prices conflates split adjustment with
-# realized friction — a known weakness of per-share+spread when the
-# spread floor is set without reference to name-level liquidity (see
-# `memory/feedback_per_share_on_adjusted_prices.md`). For nasdaq100, the
-# analogous case study, we sidestep this by using *measured* per-asset
-# half-spreads from AlgoSeek NBBO quotes; we do not have an equivalent
-# vendor product spanning the full S&P 500 universe with split-adjusted
-# alignment, so the bps regime is the headline. The per-share regime is
-# retained as an exploratory companion in `16_costs.py` — the disagreement
-# between regimes is the lesson, not a defect to paper over.
-
-# %% [markdown]
-# ### B.4 Feasibility Ratio
+# Three numbers summarise what B.3 and B.4 drew. The first is the median absolute move over the
+# primary horizon, as a multiple of the declared round trip, which says how much larger a typical
+# move is than a typical cost. The second is the fraction of moves larger than that round trip,
+# which is where the exceedance curve crosses the cost line. The third is how much of the ordering
+# is left one decision date later.
 #
-# An edge-to-cost ratio at the strategy's declared weekly horizon confirms that
-# typical move magnitude exceeds the cost floor before we proceed further.
+# None of them says the strategy earns anything. A move counts the same whether the share rises or
+# falls, and a long position is helped by one and hurt by the other. What they rule out is the case
+# where the design fails immediately, because a typical move is smaller than the cost of taking the
+# position.
 
 # %%
-median_weekly_abs_return = float(np.median(weekly_abs))
-feasibility_ratio = median_weekly_abs_return / ROUND_TRIP_COST
-print(
-    f"Median weekly |return|: {median_weekly_abs_return:.4f} "
-    f"({median_weekly_abs_return * 10000:.1f} bps)"
+primary = f"h{HORIZONS[0]}"
+median_move, above_cost = (
+    returns.drop_nulls(primary)
+    .select(pl.col(primary).median(), (pl.col(primary) > COST_BPS).mean().alias("share"))
+    .row(0)
 )
-print(f"Round-trip cost: {ROUND_TRIP_COST:.4f} ({ROUND_TRIP_COST_BPS} bps)")
-print(f"Edge-to-cost ratio: {feasibility_ratio:.1f}x")
-print(f"Assessment: {'PROCEED' if feasibility_ratio > 1.0 else 'KILL -- edge too thin'}")
+one_week = persistence.filter(pl.col("lag") == 1)["rho"][0]
+print(
+    f"Median {HORIZONS[0]}-session move {median_move:.0f} bps, {median_move / COST_BPS:.0f}x the "
+    f"declared {COST_BPS} bps round trip, and {above_cost:.3f} of moves are larger than it\n"
+    f"Priced per share instead, the same round trip runs from {cost['cheapest'].min():.2f} bps on "
+    f"the most expensive stock to {cost['dearest'].max():.0f} bps on the cheapest\n"
+    f"The ranking correlates {one_week:.2f} with itself one decision date later, "
+    f"{persistence['rho'][-1]:.2f} after {PERSISTENCE_WEEKS}"
+)
+
+# %% [markdown] tags=["results"]
+# The median absolute five-session move is 211 bps, sixteen times the declared 13 bps round trip,
+# and 0.964 of moves exceed it. Priced per share instead, the same round trip runs from 0.04 bps on
+# the most expensive stock to 619 bps on the cheapest. The implied volatility ordering correlates
+# 0.92 with itself one decision date later and 0.75 after eight.
 
 # %% [markdown]
-# ### B.5 Autocorrelation Support for Weekly Cadence
+# ## C. Design decisions
 #
-# Weekly cadence is motivated by IV persistence: if IV features are highly
-# autocorrelated at the daily horizon, daily rebalancing adds costs without
-# capturing new information. Equity-return autocorrelation at lag-1 and lag-5
-# is the simplest read on whether the underlying price process itself
-# contains daily-frequency edge to exploit.
+# The sections above are evidence. This section is where that evidence meets the choices recorded
+# in `setup.yaml`, and says what each one rests on.
+#
+# ### C.1 When to decide, and when to trade
+#
+# `setup.yaml::decision.snapshot` reads the data at the Friday close and
+# `decision.execution_delay` fills at the following Monday open. Unlike the option-selling case
+# study alongside this one, this strategy trades shares, and shares have an opening auction, so the
+# first price a decision taken at Friday's close can reach is Monday's open rather than another
+# close. `decision.iv_feature_lag` is the other half of the same argument: a surface summary
+# describes the close it is stamped at and is not published before it, so the ranking is built from
+# the previous session's value and cannot read a number that did not exist when the decision was
+# taken.
+#
+# Section B.4 supports acting weekly rather than daily. Most of the ordering is still there a week
+# later, so a daily rebalance would pay the spread again for a cross-section that has barely moved;
+# but enough of it is gone within a few weeks that a monthly rebalance would be acting on a stale
+# ranking.
+#
+# ### C.2 What would send this design back
+#
+# A feasibility study is only useful if some result would have stopped it. Three would, and each is
+# measured where its evidence exists rather than here.
+#
+# The one this notebook could have produced is a cost failure: if a typical move in the share price
+# were no larger than what a round trip costs, no ranking would repair that. Section B.5 is that
+# measurement, and Chapter 18 repeats it against the trades a backtest actually places, sweeping
+# both cost regimes rather than assuming one.
+#
+# The other two are outcomes of the strategy rather than properties of the data, and neither can be
+# settled at this stage. Chapter 7 asks whether the ranking has any relationship at all to the
+# returns that follow it. Chapter 11 asks the question specific to this case study: the option
+# market's opinion has to be worth more than the share price history that is free, so the
+# volatility features have to add something over realized volatility and momentum computed from the
+# bars alone. If they do not, the option data is an expensive way to rebuild a price signal.
+#
+# ### C.3 What the strategy does with the ranking
+#
+# `setup.yaml::mapping.class` holds the top of the ranking long and in equal weights. Long-only
+# keeps borrow and locate frictions out of an example whose subject is the signal, and equal weight
+# avoids stacking a second optimization on top of the one being tested. Chapter 17 sweeps the
+# allocators against that baseline.
+
+# %% [markdown]
+# ## D. Walk-forward structure
+#
+# ### D.1 How much an evaluation has to spend
+#
+# A panel of stock-sessions looks large, but a strategy that decides once a week does not get to
+# treat every row as an independent opportunity. What it spends is decision dates, and Section B.4
+# is why even those are worth less than their count suggests: consecutive weeks rank the same
+# stocks in nearly the same order, so they are not independent draws.
 
 # %%
-acf_results = (
-    daily_returns.with_columns(
-        pl.col("return").shift(1).over("symbol").alias("ret_lag1"),
-        pl.col("return").shift(5).over("symbol").alias("ret_lag5"),
-    )
-    .drop_nulls()
-    .select(
-        pl.corr("return", "ret_lag1").alias("acf_lag1"),
-        pl.corr("return", "ret_lag5").alias("acf_lag5"),
-    )
-    .row(0, named=True)
+print(
+    f"Trading sessions {SESSIONS} | decision dates {len(breadth):,} | stocks per decision date "
+    f"{breadth['n_stocks'].min()} to {breadth['n_stocks'].max()}, median "
+    f"{breadth['n_stocks'].median():.0f}\n"
+    f"Below the {BREADTH_FLOOR} the book needs on "
+    f"{breadth.filter(pl.col('n_stocks') < BREADTH_FLOOR).height} of {len(breadth)} decision dates"
 )
-acf_lag1 = float(acf_results["acf_lag1"])
-acf_lag5 = float(acf_results["acf_lag5"])
-print(f"Return autocorrelation: lag-1 = {acf_lag1:+.4f}, lag-5 = {acf_lag5:+.4f}")
-print("Both lags are near zero — daily moves are predominantly noise from a")
-print("price-process perspective, consistent with the weekly cadence in setup.yaml.")
 
 # %% [markdown]
-# ---
+# ### D.2 The folds
 #
-# ## Section C: Design Decisions
+# A model is fitted on one stretch of history and evaluated on the stretch that follows it, then
+# the pair moves forward and the process repeats. Each fit-then-evaluate pair is a **fold**, and
+# evaluating this way is called **walk-forward**, because the split always runs in the direction
+# time does.
 #
-# Design decisions are the strategy choices encoded in `setup.yaml` that the
-# feasibility evidence above supports. They are justified here, not in the YAML.
-
-# %% [markdown]
-# ### C.1 Decision Cadence
+# One detail decides whether the evaluation is honest. A position opened near the end of a training
+# block is labelled with a price from after that block ends, so validating on the session
+# immediately following training would score the model on an outcome it had partly seen. The fix is
+# to leave a gap between the two at least as wide as the outcome takes to arrive, and that gap is
+# called **purging**. Its width comes from `labels.buffer`, which `generate_cv_splits` counts in
+# trading sessions on the calendar `evaluation.calendar` names.
 #
-# `setup.yaml::decision.cadence: weekly_friday_close` is chosen for three
-# converging reasons:
+# What the splitter is handed is the sessions this panel carries: the dates on which some stock had
+# both a solved implied volatility and a share price. That is the timeline the later stages build
+# their folds from as well, because they read the label file, which is written on the same dates
+# and stops a horizon short of the sample's end since a forward return needs sessions after it. The
+# splitter numbers folds from zero backwards from the most recent, so fold 0 is the one that ends
+# against the holdout and fold 1 the earlier one. The figure draws them earliest-first and labels
+# each with that number, which is why the labels count down; every later stage prints the same ones.
+# It draws the boundaries the splitter returned rather than recomputing them.
 #
-# 1. **Signal persistence**: Implied-volatility features are slow-moving by
-#    construction (interpolated across strikes and maturities, smoothed by the
-#    options surface). Daily rebalancing on IV signals adds turnover without
-#    materially refreshing the information set.
-# 2. **Underlying autocorrelation**: Daily equity returns show negligible
-#    autocorrelation at lag 1 and lag 5 (B.5 above), so there is no daily-grade
-#    edge in the price process itself that a higher-frequency strategy would
-#    capture.
-# 3. **Cost headroom at the weekly horizon**: Weekly absolute moves comfortably
-#    exceed the 13 bps round-trip cost in the vast majority of observations
-#    (B.3 above).
-#
-# Execution timing — `decision.snapshot: friday_16:00_et`,
-# `decision.execution_delay: monday_open`, `decision.iv_feature_lag: 1_day` —
-# keeps the protocol point-in-time: IV features observed at one Friday close
-# are used to make decisions executed at the *next* Monday open, with a one-day
-# lag absorbing any end-of-day publication delay on the surface.
-
-# %% [markdown]
-# ### C.2 Kill Conditions
-#
-# Kill conditions are falsifiable checkpoints — if any triggers, the strategy
-# is abandoned or substantially reworked. Anchored to the feasibility evidence
-# above (cost-exceedance, edge-to-cost, autocorrelation):
-#
-# - **KC1 (IC floor)**: Cross-sectional IC < 0.01 with t-stat < 2.0 across all
-#   IV-derived families. Gate: Chapter 7–8 feature evaluation.
-# - **KC2 (edge–cost)**: Edge-to-cost ratio < 1.0x at the weekly horizon after
-#   realistic transaction costs. B.4 above tests this gate on raw return
-#   magnitudes before the model is even trained.
-# - **KC3 (IV redundancy)**: Incremental IC of IV-derived features over plain
-#   realized-volatility features is ≤ 0. If options-derived signals add nothing
-#   beyond what RV already captures, the multi-source design has no payoff.
-#   Gate: Chapter 8 + Chapter 13 model-comparison panel.
-
-# %% [markdown]
-# ### C.3 Mapping Class
-#
-# `setup.yaml::mapping` declares the simplest credible mapping: **long-only,
-# equal-weight, rank by IV signal** (`mapping.class:
-# long_only_rank_and_rebalance`, `sizing: equal_weight`, `entry_logic:
-# rank_by_iv_signal`). Long-only is appropriate because (a) the case study
-# trades S&P 500 underlyings, which are easy to long but introduce short-side
-# borrow and locate frictions outside the scope of this teaching example,
-# (b) it isolates the ranking signal from short-side complexity, and (c) it
-# keeps the comparison to an equal-weight S&P 500 benchmark clean. Equal-weight
-# sizing is the minimal-assumption rule — it avoids introducing a secondary
-# optimization (risk-parity, inverse-vol, MVO) that would confound evaluation
-# of the IV-derived ranking signal itself. Chapter 17 explores alternative
-# weighting schemes via the `backtest.sweep.allocators` grid in `setup.yaml`.
-
-# %% [markdown]
-# ---
-#
-# ## Section D: Walk-Forward Structure (Section 6.5)
-#
-# We verify that the data supports the walk-forward design declared in
-# `setup.yaml::evaluation` (`n_splits`, `train_size`, `val_size`,
-# `holdout_start`). The 5-year sample (2017–2021) constrains depth: with a
-# 2-year rolling train window and a 1-year test window, we get two
-# non-overlapping validation folds (test years 2019 and 2020), then the 2021
-# holdout.
-
-# %% [markdown]
-# ### D.1 Effective Sample Size and Data Coverage
+# The purge gap is narrow next to training blocks measured in years, so counting it off the session
+# timeline is the only way to confirm it is as wide as the buffer declares. The three assertions
+# check that, the fold count, and that no validation window reaches the holdout.
 
 # %%
-start_dt = datetime.fromisoformat(START_DATE)
-end_dt = datetime.fromisoformat(END_DATE)
-years_of_data = (end_dt - start_dt).days / 365.25
-weeks_per_year = 52
-raw_decisions = int(weeks_per_year * years_of_data)
-
-print("Data Coverage:")
-print(f"  Period: {START_DATE} to {END_DATE} ({years_of_data:.1f} years)")
-print(f"  Raw weekly decision points: ~{raw_decisions}")
-print(f"  Universe at >= {COVERAGE_THRESHOLD:.0%} coverage: {n_above_threshold} symbols")
-print(
-    "  Effective sample size: Lower due to IV-feature persistence "
-    "(~1 quasi-independent obs per month per symbol)"
+splits = generate_cv_splits(
+    panel.select("timestamp"),
+    case_study_id=CASE_STUDY_ID,
+    label_buffer=LABEL_BUFFER,
+    outcome_horizon=SETUP["labels"]["horizons"][PRIMARY_LABEL],
+    date_col="timestamp",
 )
 
-# %% [markdown]
-# ### D.2 Walk-Forward Fold Demonstration
-#
-# `case_studies/utils/cv_window.py` owns the operational splits; this cell
-# reproduces the fold boundaries from canonical `setup.yaml` parameters to
-# verify the data supports the declared design. Each fold has:
-#
-# - **Train window**: `setup.yaml::evaluation.train_size` (2Y)
-# - **Test window**: `setup.yaml::evaluation.val_size` (1Y)
-# - **Purge gap**: 2 weeks between train end and test start (covers the 10-day
-#   forward-return variant)
-
-# %%
-n_splits_declared = int(SETUP["evaluation"]["n_splits"])
-purge_weeks = 2  # covers the fwd_ret_10d variant buffer
-train_weeks = 2 * weeks_per_year
-test_weeks = 1 * weeks_per_year
-step_weeks = 1 * weeks_per_year
-
-# Friday-aligned decision dates within the CV window (before holdout)
-weekly_dates = (
-    sp500_bars.with_columns(pl.col("timestamp").dt.strftime("%G-W%V").alias("week"))
-    .group_by("week")
-    .agg(pl.col("timestamp").max().alias("timestamp"))
-    .sort("timestamp")["timestamp"]
-    .to_list()
-)
-holdout_start_dt = pl.Series([HOLDOUT_START]).str.to_date("%Y-%m-%d").item()
-cv_dates = [d for d in weekly_dates if d < holdout_start_dt]
-
-splits = []
-test_start_idx = train_weeks
-while test_start_idx + test_weeks <= len(cv_dates):
-    train_start_idx = test_start_idx - train_weeks
-    train_end_idx = test_start_idx - purge_weeks
-    test_end_idx = test_start_idx + test_weeks
-
-    split = {
-        "fold": len(splits) + 1,
-        "train_start": cv_dates[train_start_idx].strftime("%Y-%m-%d"),
-        "train_end": cv_dates[train_end_idx - 1].strftime("%Y-%m-%d"),
-        "test_start": cv_dates[test_start_idx].strftime("%Y-%m-%d"),
-        "test_end": cv_dates[test_end_idx - 1].strftime("%Y-%m-%d"),
-        "purge_weeks": purge_weeks,
-    }
-    splits.append(split)
-    test_start_idx += step_weeks
-
-print(f"Generated {len(splits)} walk-forward folds (cv dates: {len(cv_dates)})")
-assert len(splits) == n_splits_declared, (
-    f"Expected {n_splits_declared} folds (setup.yaml), got {len(splits)}"
-)
-last_test_end = splits[-1]["test_end"]
-print(f"Last fold test end: {last_test_end}  |  Holdout start: {HOLDOUT_START}")
-assert last_test_end < HOLDOUT_START, (
-    f"Last fold ({last_test_end}) overlaps holdout ({HOLDOUT_START})"
-)
-
-# %% [markdown]
-# **Walk-forward fold summary:**
-
-# %%
-splits_df = pl.DataFrame(splits)
-splits_df
-
-# %% [markdown]
-# ---
-#
-# ## Section E: Coverage Artifact
-#
-# Per-symbol options-coverage is the one decision-relevant derived artifact
-# this notebook generates (everything else lives in `setup.yaml`). Downstream
-# feature-construction code (`03_financial_features.py`) consumes the
-# threshold rule directly via `data.load_sp500_options_surface()`, but
-# persisting the per-symbol table here gives readers a quick sanity check
-# without re-loading the surface.
-
-# %%
-coverage_path = CASE_DIR / "config" / "exploration" / "coverage.csv"
-# Secondary sort on symbol makes the persisted artifact deterministic (ties on
-# coverage would otherwise reorder across runs).
-coverage.select(["symbol", "n_days", "coverage"]).sort(
-    ["coverage", "symbol"], descending=[True, False]
-).write_csv(coverage_path)
-print(f"Written: {coverage_path} ({coverage.height:,} symbols)")
-
-# %% [markdown]
-# ---
-#
-# ## Section F: Findings vs `setup.yaml`
-#
-# The canonical strategy declarations live in `config/setup.yaml`. This section
-# enumerates each declared knob alongside the feasibility evidence above that
-# motivates it. `setup.yaml` is not regenerated here — it is the hand-curated
-# source of truth, and this notebook reads it.
-
-# %%
-median_d_abs_pct = float(np.median(daily_abs) * 100)
-median_w_abs_pct = float(np.median(weekly_abs) * 100)
-frac_d_above_cost = float((daily_abs > ROUND_TRIP_COST).mean())
-frac_w_above_cost = float((weekly_abs > ROUND_TRIP_COST).mean())
-n_folds_generated = int(len(splits))
-
-print("=" * 78)
-print("Setup.yaml knobs vs feasibility evidence")
-print("=" * 78)
-
-print()
-print(
-    f"universe.n_assets = {SETUP['universe']['n_assets']}  "
-    f"(rule = {SETUP['universe']['eligibility_rule']})"
-)
-print(f"  -> symbols in options surface: {n_symbols}")
-print(f"  -> symbols >= {COVERAGE_THRESHOLD:.0%} coverage: {n_above_threshold}")
-print(f"  -> median symbol coverage: {median_coverage:.1%}")
-
-print()
-print(f"decision.cadence = {SETUP['decision']['cadence']}")
-print(
-    f"  -> median |weekly return| = {median_w_abs_pct:.2f}%; "
-    f"{frac_w_above_cost * 100:.0f}% exceed {ROUND_TRIP_COST_BPS} bps RT"
-)
-print(
-    f"  -> return autocorrelation lag-1 = {acf_lag1:+.4f}, "
-    f"lag-5 = {acf_lag5:+.4f} (near zero -> weekly cadence justified)"
-)
-print(
-    f"  -> iv_feature_lag = {SETUP['decision']['iv_feature_lag']} "
-    f"(absorbs end-of-day IV publication delay)"
-)
-
-print()
-print(
-    f"costs.class = {SETUP['costs']['class']} "
-    f"({SETUP['costs']['round_trip_cost_bps']} bps RT, "
-    f"per-leg range {SETUP['costs']['per_leg_cost_bps_range']})"
-)
-print(f"  -> at {ROUND_TRIP_COST_BPS} bps RT: weekly edge-to-cost = {feasibility_ratio:.0f}x")
-print(f"  -> daily moves > {ROUND_TRIP_COST_BPS} bps: {frac_d_above_cost * 100:.0f}%")
-
-print()
-print(f"mapping.class = {SETUP['mapping']['class']} (sizing = {SETUP['mapping']['sizing']})")
-print("  -> long-only, equal-weight; IV-derived ranking signal evaluated in Chapters 7-8")
-
-print()
-print(f"labels.primary = {SETUP['labels']['primary']}  (buffer = {SETUP['labels']['buffer']})")
-print(
-    f"  -> median |weekly return| = {median_w_abs_pct:.2f}% = "
-    f"{(median_w_abs_pct / 100) / ROUND_TRIP_COST:.0f}x a "
-    f"{ROUND_TRIP_COST_BPS} bps RT cost"
-)
-
-print()
-print(f"labels.variants = {SETUP['labels']['variants']}")
-print("  -> 10d / risk-adjusted / direction variants; buffer 10D covers the longest horizon")
-
-print()
-print(
-    f"evaluation.n_splits = {SETUP['evaluation']['n_splits']}  "
-    f"(train_size = {SETUP['evaluation']['train_size']}, "
-    f"val_size = {SETUP['evaluation']['val_size']})"
-)
-print(f"  -> generated {n_folds_generated} folds; declared count matches")
-print(f"  -> holdout {HOLDOUT_START} to {HOLDOUT_END}; last test ends {splits[-1]['test_end']}")
-
-# %% [markdown]
-# ### Persist Feasibility Findings
-
-# %%
-feasibility_report = {
-    "case_study_id": STRATEGY_ID,
-    "computed_at_utc": datetime.now(UTC).isoformat(),
-    "data_period": {"start": START_DATE, "end": END_DATE},
-    "universe": {
-        "n_assets_declared": int(SETUP["universe"]["n_assets"]),
-        "n_symbols_in_surface": int(n_symbols),
-        "n_symbols_above_coverage_threshold": int(n_above_threshold),
-        "coverage_threshold": float(COVERAGE_THRESHOLD),
-        "median_coverage": float(median_coverage),
-        "min_coverage": float(min_coverage),
-        "expected_trading_days": int(expected_trading_days),
-        "actual_dates_in_data": int(actual_dates_in_data),
-    },
-    "return_distribution_abs_pct": {
-        "daily_median": median_d_abs_pct,
-        "weekly_median": median_w_abs_pct,
-    },
-    "cost_exceedance_pct": {
-        "round_trip_cost_bps": ROUND_TRIP_COST_BPS,
-        "daily": frac_d_above_cost * 100,
-        "weekly": frac_w_above_cost * 100,
-    },
-    "feasibility_ratio_weekly": float(feasibility_ratio),
-    "autocorrelation": {
-        "lag_1": acf_lag1,
-        "lag_5": acf_lag5,
-    },
-    "walk_forward": {
-        "n_folds_generated": n_folds_generated,
-        "n_splits_declared": int(SETUP["evaluation"]["n_splits"]),
-        "train_weeks": train_weeks,
-        "test_weeks": test_weeks,
-        "purge_weeks": purge_weeks,
-        "holdout_start": HOLDOUT_START,
-        "holdout_end": HOLDOUT_END,
-        "last_test_end": splits[-1]["test_end"],
-    },
+grid = np.sort(panel["timestamp"].unique().to_numpy())
+purge_gaps = {
+    int(((grid > np.datetime64(s["train_end"])) & (grid < np.datetime64(s["val_start"]))).sum())
+    for s in splits
 }
+last_val = max(split["val_end"] for split in splits)
+assert len(splits) == SETUP["evaluation"]["n_splits"], "fold count differs from setup.yaml"
+assert last_val < np.datetime64(HOLDOUT_START), "a fold reaches into the holdout"
+assert purge_gaps == {BUFFER_SESSIONS}, "a purge gap is not the declared label buffer"
+print(
+    f"{len(splits)} folds | purge gap {min(purge_gaps)} sessions at every boundary, from "
+    f"labels.buffer {LABEL_BUFFER} | last validation ends {last_val.date()}, before the holdout "
+    f"opens on {HOLDOUT_START}"
+)
 
-report_path = EXPLORATION_DIR / "feasibility_report.json"
-with open(report_path, "w") as f:
-    json.dump(feasibility_report, f, indent=2)
-print(f"Written: {report_path}")
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+fold_timeline(ax, splits, holdout=(HOLDOUT_START, HOLDOUT_END))
+ax.set_xlabel("Session")
+add_message_title(
+    ax,
+    "Both folds roll forward and end before the holdout opens",
+    subtitle="Boundaries as generate_cv_splits returned them; the purge gap separates each pair",
+)
+plt.show()
 
 # %% [markdown]
-# ---
+# ## E. What this notebook hands on
 #
-# ## Key Takeaways
+# Nothing. Membership follows the option listings themselves, as Section B.2 showed, so there is no
+# eligibility table for a later stage to filter on, and `03_financial_features` rebuilds the same
+# universe by calling the same two loaders over the same window.
+
+# %% [markdown]
+# ## F. What the evidence says about each setting
 #
-# 1. **Universe**: Options coverage is the binding eligibility filter. A 90%
-#    coverage threshold against expected NYSE trading days admits a broad
-#    S&P 500 sample; `setup.yaml::universe.n_assets` records the post-filter
-#    count.
-# 2. **Cost feasibility**: Both daily and weekly absolute moves clear the
-#    13 bps round-trip cost in the vast majority of observations. Friction is
-#    *not* the binding constraint for this liquid large-cap universe.
-# 3. **Cadence**: Weekly Friday-close is anchored to IV-feature persistence
-#    (signals are slow-moving by construction) and the near-zero autocorrelation
-#    of daily returns (no daily-grade edge in the price process to chase).
-# 4. **Mapping**: Long-only equal-weight as the simplest credible baseline;
-#    alternative allocators sweep in `setup.yaml::backtest.sweep.allocators`
-#    (explored in Chapter 17).
-# 5. **Evaluation**: Two walk-forward folds (test years 2019 and 2020) fit the
-#    5-year sample; the 2021 holdout is cleanly separated by a 2-week purge
-#    that covers the 10-day forward-return variant.
-# 6. **Kill conditions**: KC2 (edge-to-cost > 1.0x) already cleared —
-#    feasibility ratio at the weekly horizon is comfortably above 1.0 on raw
-#    return magnitudes. KC1 (IC floor) and KC3 (IV redundancy over RV) are
-#    tested in later chapters.
+# One row per setting: the evidence behind it, and the condition under which a reader working on
+# their own data would choose differently.
 #
-# **Known limitations**:
-# - The 5-year sample (2017–2021) is short relative to most equity case
-#   studies; effective sample size is further reduced by IV persistence.
-# - Coverage thresholding is fraction-based against expected trading days; a
-#   symbol may pass the 90% test yet still have multi-week gaps within its
-#   observed window. Downstream feature pipelines should re-check at decision
-#   time.
-# - Layer-1 survivorship bias (the universe is defined as S&P 500 *with*
-#   options coverage as observed in the dataset) is documented but not
-#   resolved.
+# | Setting | Evidence | Choose differently when |
+# |---|---|---|
+# | `universe.n_assets` | B.2, stocks that can be ranked at each decision date | the count on a decision date falls towards the number of positions the book has to fill |
+# | `decision.cadence` | B.3 the move distribution, B.4 how long the ordering lasts | the ordering is replaced inside one week, or moves stop clearing the round trip |
+# | `costs.model` | B.3, the per-share band against the flat percentage line | a measured per-stock spread arrives, which is what would make the per-share regime the headline rather than the companion |
+# | `evaluation.n_splits` | D.1 decision dates, D.2 the fold boundaries | the folds no longer fit the development period ahead of the holdout |
+
+# %%
+thin = breadth.filter(pl.col("n_stocks") < BREADTH_FLOOR)
+print(
+    f"universe.n_assets {SETUP['universe']['n_assets']}, {panel['symbol'].n_unique()} stocks "
+    f"quoted a solved implied volatility, {breadth['n_stocks'].min()} to "
+    f"{breadth['n_stocks'].max()} of them per decision date, below the {BREADTH_FLOOR} the book "
+    f"needs on {thin.height} of {len(breadth)} dates\n"
+    f"decision.cadence {SETUP['decision']['cadence']} | decision.execution_delay "
+    f"{SETUP['decision']['execution_delay']} | labels.primary {PRIMARY_LABEL} | labels.buffer "
+    f"{LABEL_BUFFER}\n"
+    f"costs.model {SETUP['costs']['model']} at {COST_BPS} bps; the same round trip charged per "
+    f"share spans {cost['cheapest'].min():.2f} to {cost['dearest'].max():.0f} bps across the "
+    f"universe\n"
+    f"evaluation.n_splits {SETUP['evaluation']['n_splits']}, generated {len(splits)}, last "
+    f"validation ends {last_val.date()}, holdout untouched"
+)
+
+# %% [markdown] tags=["results"]
+# 609 stocks quote a solved implied volatility over the development period, and between 213 and 503
+# of them can be ranked on a decision date, against a declared universe of 633 and a book of 20
+# that no date comes close to failing to fill. The declared 13 bps round trip is the same charge as
+# anything from 0.04 to 619 bps if it is levied per share instead. Two folds are generated, the
+# last validation ending 2020-12-23, ten sessions of purging at every boundary.
+
+# %% [markdown]
+# ## Key takeaways
 #
-# **Artifacts written**:
-# - `config/exploration/coverage.csv`: per-symbol options-coverage table.
-# - `config/exploration/feasibility_report.json`: summary numbers downstream
-#   notebooks and the chapter README can cite without re-running.
+# 1. **A placeholder is not a measurement.** Where a vendor writes a sentinel value for a
+#    calculation that failed, a ranking will happily sort on it, because it is a number and a
+#    drop-missing leaves it in place; find out what a file does with failure before computing
+#    anything from the column, and normalise it at the loader so every reader gets one answer.
+# 2. **Count the universe on the dates the strategy acts.** Where membership follows a listing
+#    calendar rather than a liquidity rule, the count cycles for reasons the strategy does not
+#    control, and an average over all sessions hides it.
+# 3. **Express a cost in the unit it is actually charged in.** A charge per share and a charge as a
+#    percentage of the trade are different assumptions about friction, and they rank a universe
+#    spanning three orders of magnitude in price very differently.
+# 4. **Measure the persistence of the thing the strategy acts on.** For a strategy that ranks, that
+#    is the ordering across entities and not the level inside one, and correlating two orderings
+#    keeps the entities that come and go, which correlating a single entity's history cannot.
+# 5. **Adjust prices for splits and dividends, and stay inside one security identity**, so that a
+#    corporate action does not enter the return distribution as a move.
 #
-# **Next**: Chapter 7 (`02_labels.py`) creates 5-day and 10-day forward equity
-# returns plus risk-adjusted and direction variants declared in
-# `setup.yaml::labels`.
+# ### Known limitations
+#
+# - Four years of development period, of which the ordering's slow decay makes fewer independent
+#   observations than the count of decision dates suggests.
+# - Cost here is the declared commission and half-spread. Market impact needs a position size to be
+#   expressed against and enters at the cost stage.
+# - The moves in Section B.3 are unsigned and unconditional. Nothing here says the ranking selects
+#   the stocks that move upward, which is what Chapter 7 onward measures.
+# - The implied volatility is read from contracts inside a maturity window rather than at a fixed
+#   tenor, so a change of expiration moves the series alongside the volatility it is meant to
+#   measure.
+#
+# **Next**: labels at the declared horizons, built on this development period.

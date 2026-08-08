@@ -29,10 +29,18 @@ SETUP_YAML = REPO_ROOT / "case_studies" / "etfs" / "config" / "setup.yaml"
 HOLDOUT_SCOPED_NOTEBOOKS = [
     ("08_financial_features/05_feature_selection.py", "ic_by_date"),
     ("08_financial_features/06_robustness_sensitivity.py", "def compute_momentum_ic_series"),
-    ("case_studies/etfs/03_financial_features.py", "ic_matrix = np.full"),
     ("case_studies/etfs/02_labels.py", "cross_sectional_ic_series("),
     ("case_studies/etfs/05_evaluation.py", "ic_series_data = {feat"),
     ("case_studies/crypto_perps_funding/02_labels.py", "cross_sectional_ic_series("),
+    ("case_studies/cme_futures/02_labels.py", "cross_sectional_ic_series("),
+    ("case_studies/fx_pairs/02_labels.py", "cross_sectional_ic_series("),
+    ("case_studies/us_firm_characteristics/02_labels.py", "cross_sectional_ic_series("),
+    (
+        "case_studies/sp500_equity_option_analytics/02_labels.py",
+        "cross_sectional_ic_series(",
+    ),
+    ("case_studies/sp500_options/02_labels.py", "cross_sectional_ic_series("),
+    ("case_studies/nasdaq100_microstructure/02_labels.py", "cross_sectional_ic_series("),
 ]
 
 
@@ -119,11 +127,30 @@ def test_holdout_filter_precedes_first_ic_computation(rel_path: str, first_ic_ma
 # different, equally sound mechanism, and asserting this one against them would
 # be wrong. Seven case studies have not been audited for this class of leak; add
 # their notebooks here as each is checked.
+# ``case_studies/etfs/03_financial_features.py`` was in these lists and is in
+# none of them now: ``rules/stages/03-financial-features.md`` removes the IC
+# screen from stage 03, so that notebook reads no label and has no endpoint to
+# purge. Its own seal is a different check -- it rebuilds the panel with the
+# holdout withheld and requires every emitted feature value to agree.
+# ``case_studies/us_firm_characteristics/02_labels.py`` is deliberately absent, and it is the
+# one case study where that is a property of the data rather than a gap. The Chen-Pelger-Zhu
+# release pairs the characteristics observed at the close of month t-1 with the return earned
+# over month t and dates the row by month t, so a row's label resolves on its own timestamp
+# and the label endpoint IS the signal date -- the notebook derives it as such and filters on
+# it. Shifting the timestamp forward by the horizon to satisfy the pattern below would purge a
+# month that is already sealed and would drop every firm's final observation, whenever it
+# fell. The alignment is measured rather than assumed: 02_labels correlates ``ST_REV``, the
+# short-term-reversal characteristic, against the label at three candidate lags and only the
+# previous row's return carries it.
 LABEL_ENDPOINT_PURGED_NOTEBOOKS = [
     "case_studies/etfs/02_labels.py",
-    "case_studies/etfs/03_financial_features.py",
     "case_studies/etfs/05_evaluation.py",
     "case_studies/crypto_perps_funding/02_labels.py",
+    "case_studies/cme_futures/02_labels.py",
+    "case_studies/fx_pairs/02_labels.py",
+    "case_studies/sp500_equity_option_analytics/02_labels.py",
+    "case_studies/sp500_options/02_labels.py",
+    "case_studies/nasdaq100_microstructure/02_labels.py",
 ]
 
 # Of the four above, only etfs/05 uses a market-wide calendar; the other three
@@ -140,10 +167,40 @@ LABEL_ENDPOINT_PURGED_NOTEBOOKS = [
 # form regardless would remove the dependence on that data property; it is
 # deferred because editing 05 forces the case study's evaluation to be
 # re-executed on a newer feature vintage.
+# ``entity_col`` names the column the endpoint must be shifted within, which is the
+# entity a label may not cross. It is ``symbol`` for seven of the nine case studies and
+# ``product`` for cme_futures.
+# ``sp500_equity_option_analytics/02_labels`` is deliberately absent: its entity is the
+# security (``sec_id``), not the ticker. A ticker there is reassigned to another company
+# after a merger or a spin-off, and ``adj_factor`` restarts with the new security, so
+# shifting within ``symbol`` would be the under-purge this list exists to prevent rather
+# than the fix for it. It is in both lists above, where the mechanism is what is checked.
+# ``nasdaq100_microstructure/02_labels`` is deliberately absent from this third list while
+# being present in the two above. Its labels are intraday and may not cross an overnight
+# gap, so the entity a label may not cross is the compound ``["symbol", "session_date"]``
+# and its endpoint is derived with ``.over(GROUP_COLS)``. The regex below binds a single
+# quoted column name, so it cannot express a compound key -- listing the notebook here
+# would produce a false red against a seal that is strictly stronger than the per-symbol
+# one this test checks.
+# ``etfs/03_financial_features`` is deliberately absent. It was listed here while it
+# purged on a shifted label endpoint; public #447 replaced that mechanism with a seal
+# that rebuilds the whole panel with the holdout withheld and compares all 57 columns,
+# which is checked by executing the notebook rather than by reading its source. A
+# source pattern cannot see the stronger check, so listing it here only produces a
+# false red. See agent-workspace #141.
+# ``sp500_options/02_labels`` is deliberately absent, and for the opposite reason to
+# ``etfs/05``: its endpoint is not an approximation that needs the per-symbol form. The
+# hold-to-expiry label settles on the expiration written into the contract and the
+# fixed-horizon variants on the exit session recorded in the round-trip artifact, so
+# ``_label_end`` is the exact resolution date of each individual trade rather than a
+# calendar shift of the signal date. The notebook checks the recorded exit dates against a
+# shift of the panel calendar by the declared horizon, which is what
+# ``test_holdout_purge_is_on_the_label_endpoint`` above matches on.
 PER_SYMBOL_ENDPOINT_NOTEBOOKS = [
-    "case_studies/etfs/02_labels.py",
-    "case_studies/etfs/03_financial_features.py",
-    "case_studies/crypto_perps_funding/02_labels.py",
+    ("case_studies/etfs/02_labels.py", "symbol"),
+    ("case_studies/crypto_perps_funding/02_labels.py", "symbol"),
+    ("case_studies/cme_futures/02_labels.py", "product"),
+    ("case_studies/fx_pairs/02_labels.py", "symbol"),
 ]
 
 
@@ -300,8 +357,12 @@ def test_crypto_tcn_requires_cuda_and_hashes_current_inputs() -> None:
     assert "current CPU" not in source
 
 
-@pytest.mark.parametrize("rel_path", PER_SYMBOL_ENDPOINT_NOTEBOOKS, ids=lambda p: p)
-def test_label_endpoint_is_derived_per_symbol(rel_path: str) -> None:
+@pytest.mark.parametrize(
+    ("rel_path", "entity_col"),
+    PER_SYMBOL_ENDPOINT_NOTEBOOKS,
+    ids=[rel_path for rel_path, _ in PER_SYMBOL_ENDPOINT_NOTEBOOKS],
+)
+def test_label_endpoint_is_derived_per_symbol(rel_path: str, entity_col: str) -> None:
     """The endpoint must be shifted within symbol, as the label generator does.
 
     A market-wide cutoff is only equivalent while every symbol trades every
@@ -315,14 +376,14 @@ def test_label_endpoint_is_derived_per_symbol(rel_path: str) -> None:
     # this test would still pass -- the same vacuous-gate failure that let the
     # 2026-07-21 revert stay green.
     assert re.search(
-        r"\.shift\(-\s*[A-Za-z_]*horizon\s*\)\s*\.over\(\s*\"symbol\"\s*\)"
+        r"\.shift\(-\s*[A-Za-z_]*horizon\s*\)\s*\.over\(\s*\"" + entity_col + r"\"\s*\)"
         r"\s*\.alias\(\s*\"_label_end\"\s*\)",
         source,
         re.IGNORECASE,
     ), (
         f"{rel_path}: the label endpoint must be derived as shift(-horizon)"
-        '.over("symbol").alias("_label_end"), matching 02_labels; a market-wide '
-        "cutoff under-purges a symbol with a gapped calendar"
+        f'.over("{entity_col}").alias("_label_end"), matching 02_labels; a market-wide '
+        "cutoff under-purges an entity with a gapped calendar"
     )
 
 
@@ -403,38 +464,72 @@ def test_a_gapped_calendar_separates_the_two_purges() -> None:
 def evaluation_notebook_label() -> tuple[str, int]:
     """The label file and horizon ``05_evaluation`` actually uses.
 
-    05 hardcodes both, so the equivalence check has to run on its values rather
-    than the configured ones -- otherwise a config change would leave the check
-    validating a purge the notebook does not perform. Requiring them to equal the
-    configured label is what makes the hardcoding safe, and is the assertion that
-    fails if `labels.primary` moves and 05 is not moved with it.
+    05 used to hardcode both, and this helper read the two literals so the
+    equivalence check below ran on the notebook's values rather than the
+    configured ones. It no longer hardcodes them: it takes the label from
+    ``setup.yaml`` and the horizon from ``resolve_label_buffer``, so there is one
+    source of truth and a config change moves the notebook with it.
+
+    What has to be checked therefore moves too. The risk was 05 purging on a
+    label the case study no longer selects; that is now prevented by
+    construction, but only while 05 really does bind both to the config. So this
+    asserts the binding structurally and resolves the values the same way the
+    notebook does, and the caller keeps its teeth by comparing the
+    buffer-derived horizon against the one implied by the label's own name --
+    two independent config entries that a typo can still separate.
     """
     tree = ast.parse((REPO_ROOT / "case_studies" / "etfs" / "05_evaluation.py").read_text())
 
-    # Parsed rather than pattern-matched: a text match on an assignment reports
-    # the value it can see, so `HAC_MAXLAGS = 21 * 2` reads as 21 while the
-    # notebook purges on 42, and a match anywhere in the file is satisfied by a
-    # call the label frame is not built from.
-    literals: dict[str, object] = {}
-    horizon_alias: ast.expr | None = None
+    # Parsed rather than pattern-matched: a text match anywhere in the file is
+    # satisfied by a call the label frame is not built from.
+    bindings: dict[str, ast.expr] = {}
     for node in tree.body:
         if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
             continue
         target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
-        if target.id in ("PRIMARY_LABEL_FILE", "HAC_MAXLAGS") and isinstance(
-            node.value, ast.Constant
-        ):
-            literals[target.id] = node.value.value
-        elif target.id == "LABEL_HORIZON":
-            horizon_alias = node.value
+        if isinstance(target, ast.Name):
+            bindings[target.id] = node.value
 
-    assert set(literals) == {"PRIMARY_LABEL_FILE", "HAC_MAXLAGS"}, (
-        "05_evaluation no longer assigns PRIMARY_LABEL_FILE and HAC_MAXLAGS a "
-        "plain literal each; read its label and horizon from wherever it now "
-        f"takes them (found {sorted(literals)})"
+    def _calls_named(node: ast.AST, func: str) -> bool:
+        return any(
+            isinstance(sub, ast.Call)
+            and (
+                (isinstance(sub.func, ast.Name) and sub.func.id == func)
+                or (isinstance(sub.func, ast.Attribute) and sub.func.attr == func)
+            )
+            for sub in ast.walk(node)
+        )
+
+    missing = {"PRIMARY_LABEL", "HAC_MAXLAGS", "LABEL_HORIZON"} - set(bindings)
+    assert not missing, (
+        "05_evaluation no longer binds "
+        f"{sorted(missing)}; read its label and horizon from wherever it now "
+        "takes them"
     )
+
+    # The label must come from setup.yaml, not from a literal reintroduced here.
+    primary_src = ast.dump(bindings["PRIMARY_LABEL"])
+    assert "'labels'" in primary_src and "'primary'" in primary_src, (
+        "05_evaluation's PRIMARY_LABEL is no longer read from "
+        "SETUP['labels']['primary'], so it can now name a label setup.yaml does "
+        "not select"
+    )
+    assert not isinstance(bindings["PRIMARY_LABEL"], ast.Constant), (
+        "05_evaluation hardcodes PRIMARY_LABEL again; it must be read from setup.yaml"
+    )
+
+    # ...and the HAC bandwidth from the label's configured buffer.
+    assert _calls_named(bindings["HAC_MAXLAGS"], "match") and "LABEL_BUFFER" in {
+        sub.id for sub in ast.walk(bindings["HAC_MAXLAGS"]) if isinstance(sub, ast.Name)
+    }, (
+        "05_evaluation's HAC_MAXLAGS is no longer derived from LABEL_BUFFER, so "
+        "the HAC correction and the label can drift apart"
+    )
+    assert _calls_named(bindings.get("LABEL_BUFFER", ast.Constant(None)), "resolve_label_buffer"), (
+        "05_evaluation no longer resolves LABEL_BUFFER through resolve_label_buffer"
+    )
+
+    horizon_alias = bindings["LABEL_HORIZON"]
     assert isinstance(horizon_alias, ast.Name) and horizon_alias.id == "HAC_MAXLAGS", (
         "05_evaluation's purge horizon is no longer HAC_MAXLAGS itself, so this "
         "helper would report a horizon the notebook does not use"
@@ -461,8 +556,8 @@ def evaluation_notebook_label() -> tuple[str, int]:
         and any(isinstance(t, ast.Name) and t.id == "label_df" for t in node.targets)
         for read in calls_to(node.value, "read_parquet")
     ]
-    assert label_reads and all("PRIMARY_LABEL_FILE" in names_in(read) for read in label_reads), (
-        "05_evaluation must load label_df through PRIMARY_LABEL_FILE; a hardcoded "
+    assert label_reads and all("PRIMARY_LABEL" in names_in(read) for read in label_reads), (
+        "05_evaluation must load label_df through PRIMARY_LABEL; a hardcoded "
         "path there would leave the constant, and this check, describing a file "
         "the notebook does not read"
     )
@@ -484,7 +579,23 @@ def evaluation_notebook_label() -> tuple[str, int]:
             "_label_end; another horizon there purges a window this check is not "
             "measuring"
         )
-    return str(literals["PRIMARY_LABEL_FILE"]), int(literals["HAC_MAXLAGS"])  # type: ignore[arg-type]
+    # Resolved through the same function 05 calls, so a label spec that overrides
+    # setup.yaml moves this check with the notebook rather than silently past it.
+    #
+    # The setup mapping is read from SETUP_YAML rather than through
+    # `load_setup_config`, which resolves the case-study directory from the
+    # environment: under CI's ML4T_OUTPUT_DIR it returns a different file and the
+    # helper died on `KeyError: 'labels'`. This test is a static check on the
+    # committed source, so it must read the committed config.
+    from utils.artifact_specs import resolve_label_buffer
+
+    setup = yaml.safe_load(SETUP_YAML.read_text())
+    primary = str(setup["labels"]["primary"])
+    buffer = resolve_label_buffer("etfs", primary, setup)
+    assert buffer, f"no label buffer configured for {primary}"
+    match = re.match(r"^(\d+)", str(buffer))
+    assert match, f"label buffer {buffer!r} does not start with an integer"
+    return f"{primary}.parquet", int(match.group(1))
 
 
 def test_the_two_purges_agree_on_the_shipped_label_panel() -> None:
@@ -533,10 +644,10 @@ def test_the_two_purges_agree_on_the_shipped_label_panel() -> None:
 
 
 def test_the_label_and_horizon_are_resolved_from_the_configured_primary_label() -> None:
-    """One config read must drive both the endpoint purge and the HAC lag.
+    """The label and its horizon come from one config read, never from a literal.
 
-    A hardcoded 21 works until ``labels.primary`` changes, and then the purge and
-    the Newey-West lag are silently wrong for the label actually being evaluated.
+    A hardcoded 21 works until ``labels.primary`` changes, and then every window
+    that depends on the decision cycle is silently wrong for the label in force.
     """
     source = (REPO_ROOT / "case_studies" / "etfs" / "03_financial_features.py").read_text()
 
@@ -553,12 +664,13 @@ def test_the_label_and_horizon_are_resolved_from_the_configured_primary_label() 
         "03_financial_features names a label file literally; read the configured "
         "primary label's parquet instead"
     )
-    # The one resolved value has to reach both places that depend on it.
-    assert 'shift(-LABEL_HORIZON).over("symbol")' in source, (
-        "the holdout purge must shift by the resolved horizon"
-    )
-    assert "label_horizon=LABEL_HORIZON" in source, (
-        "the Newey-West lag must be set from the resolved horizon, not a literal"
+    # Two further assertions used to live here, requiring the resolved horizon to
+    # reach the endpoint purge and the Newey-West lag. Both belonged to the stage-03
+    # IC screen, which ``rules/stages/03-financial-features.md`` removes: the horizon
+    # is still resolved from the configured label, but now the only thing that reads
+    # it is the persistence figure, which has to look at least one decision cycle out.
+    assert "resolve_label_horizon(" in source, (
+        "the decision cycle must be resolved from the configured primary label"
     )
 
 

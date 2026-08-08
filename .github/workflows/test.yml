@@ -73,13 +73,34 @@ jobs:
         id: filter
         with:
           filters: |
+            # "shared" fans the matrix out to every chapter and every case study.
+            # Only files that can change what test-chapters or test-case-studies
+            # DO belong here. Those two jobs run exactly one test module each
+            # (test_chapter_notebooks.py, test_case_studies.py), and the harness
+            # they import is conftest -> preset_patches and pm_helpers ->
+            # overrides.yaml. The other ~100 files in tests/ are unit tests owned
+            # by test-unit, which is required and runs on every commit anyway, so
+            # listing 'tests/**' here re-ran nine notebook pipelines to re-test
+            # something that had already been tested in ninety seconds.
             shared:
               - 'utils/**'
               - 'data/**'
-              - 'tests/**'
               - 'pyproject.toml'
               - '.github/workflows/test.yml'
               - 'matplotlibrc'
+              - 'tests/__init__.py'
+              - 'tests/conftest.py'
+              - 'tests/pm_helpers.py'
+              - 'tests/preset_patches.py'
+              - 'tests/overrides.yaml'
+              - 'tests/fixtures/**'
+              - 'tests/test_case_studies.py'
+              - 'tests/test_chapter_notebooks.py'
+            # test-py312, test-neo4j and test-benchmark all run this module. It is
+            # not in `shared` because it drives none of the chapter or case-study
+            # matrix; it gets its own filter, wired into run_py312 below.
+            docker-notebooks:
+              - 'tests/test_docker_notebooks.py'
             ch01:
               - '01_process_is_edge/**'
             ch02-03:
@@ -238,6 +259,7 @@ jobs:
              || [[ "${{ steps.filter.outputs.ch08-09 }}" == "true" ]] \
              || [[ "${{ steps.filter.outputs.ch10 }}" == "true" ]] \
              || [[ "${{ steps.filter.outputs.ch14-15 }}" == "true" ]] \
+             || [[ "${{ steps.filter.outputs.docker-notebooks }}" == "true" ]] \
              || [[ "${{ steps.filter.outputs.ch21 }}" == "true" ]]; then
             run_py312="true"
           fi
@@ -313,10 +335,12 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           version: "latest"
+      # Same version as pyproject.toml's dev extra and .pre-commit-config.yaml;
+      # tests/test_toolchain_pins.py fails when any of the three drift.
       - name: Ruff check
-        run: uvx ruff@0.15.8 check utils/ data/ tests/
+        run: uvx ruff@0.15.14 check utils/ data/ tests/
       - name: Ruff format
-        run: uvx ruff@0.15.8 format --check utils/ data/ tests/
+        run: uvx ruff@0.15.14 format --check utils/ data/ tests/
 
   # ---------------------------------------------------------------------------
   # Reader-facing guards. Always-on, never path-filtered, no Docker, ~1 minute.
@@ -365,19 +389,10 @@ jobs:
         run: |
           source .venv/bin/activate
           python .github/scripts/check_import_resolution.py
-      # test_no_machine_specific_paths is deselected, not skipped: it is RED today
-      # (97 `/home/stefan/...` leaks across 46 notebooks, incl. shipped Ch1
-      # factor_regimes). The leaks are in outputs — cosmetic, not breakage — so
-      # they do not justify holding this gate back; but the fix is NOT to run
-      # sanitize_notebook_paths.py, which rewrites source code (it turned a real
-      # Docker mount path in ch02/16_provider_comparison into a relative path).
-      # Fix = make the sanitizer outputs-only and JSON-aware, then delete this
-      # line. Tracked so it cannot be quietly forgotten.
       - name: Notebook output hygiene
         run: |
           source .venv/bin/activate
-          python -m pytest tests/test_notebook_output_hygiene.py -q \
-            --deselect tests/test_notebook_output_hygiene.py::test_no_machine_specific_paths_in_committed_notebooks
+          python -m pytest tests/test_notebook_output_hygiene.py -q
 
   # ---------------------------------------------------------------------------
   # Fast native unit tests — download-script logic (no Docker, no network,
@@ -410,9 +425,14 @@ jobs:
         # validates the 13F artifacts by rebuilding them with the producer's own
         # build_features_and_matrix, and 13f_download.py imports requests at
         # module scope. Nothing in this job makes a network call.
+        #
+        # scipy/statsmodels/scikit-learn are the import surface of
+        # case_studies/utils/causal.py, so the p-value tail test can actually
+        # run its numeric case rather than skipping past the behavior it pins.
         run: |
           uv venv --python 3.14
-          uv pip install pytest numpy polars pyyaml python-dotenv plotly gymnasium requests
+          uv pip install pytest numpy polars pyyaml python-dotenv plotly gymnasium requests \
+            scipy statsmodels scikit-learn
       - name: Run download-logic unit tests
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -469,7 +489,76 @@ jobs:
             tests/test_pm_helpers.py \
             tests/test_create_test_data.py \
             tests/test_sample_registry_for_tests.py \
+            tests/test_toolchain_pins.py \
             -v --tb=short
+      # A two-tailed p-value written as `2 * (1 - dist.cdf(abs(t)))` returns
+      # exactly 0.0 above |t| ~8.35, so a notebook teaching inference printed
+      # `p=0` for a number no computation produced. `dist.sf` is the correct
+      # call. Two halves, both needed: the numeric case pins the behavior of
+      # the DML HAC p-value that reaches the registry, and the static scan
+      # catches the expression coming back — it is reintroduced by copying it
+      # from one chapter into another, so the scan is unfiltered by path.
+      - name: No tail probability computed as 1 - cdf
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          ML4T_PATH: ${{ github.workspace }}
+          ML4T_DATA_PATH: ${{ github.workspace }}/data
+        run: |
+          .venv/bin/python -m pytest tests/test_pvalue_tail_precision.py -v --tb=short
+
+      # The methodology ratchet. Both files are static AST/source scans over the
+      # notebook tree, so they need no data and no model deps, and both were
+      # ungated: nothing invoked either one. The cost of that showed up the first
+      # time they were run from CI's perspective — the random-split bucket still
+      # listed an occurrence that no longer exists in the source, which is the
+      # ratchet's own staleness check firing after the drift, not before it.
+      # A leak-shaped call added to any notebook now fails the PR that adds it.
+      - name: Run leakage and holdout-boundary detectors
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          ML4T_PATH: ${{ github.workspace }}
+          ML4T_DATA_PATH: ${{ github.workspace }}/data
+        run: |
+          .venv/bin/python -m pytest \
+            tests/test_leakage_detectors.py \
+            tests/test_holdout_boundary.py \
+            -v --tb=short
+
+      # Where every entry point in the repo looks for data. Forty tests covered
+      # the rule and no job ran any of them, so the contract was unguarded on
+      # every PR — found when adding the linked-worktree fallback turned three
+      # of them red and CI stayed green, because the failure only appears in a
+      # worktree and the file did not run anywhere anyway.
+      #
+      # The precondition is the load-bearing half. `anchor_ran` skips rather
+      # than fails when the startup hook did not load, which is right locally
+      # (Debian's own sitecustomize.py shadows this one on a system-interpreter
+      # venv) and wrong here: it would turn the whole step green while testing
+      # nothing. Asserting the same condition the fixture skips on makes that
+      # state red instead. It has to be the hook FIRING, not the module being
+      # importable — cwd is on sys.path, so `import sitecustomize` succeeds in
+      # the workspace whether or not anything ran it at startup.
+      - name: Run data-root anchoring contract
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          ML4T_PATH: ${{ github.workspace }}
+          ML4T_DATA_PATH: ${{ github.workspace }}/data
+        run: |
+          .venv/bin/python - <<'PY'
+          import os, subprocess, sys
+          env = {k: v for k, v in os.environ.items() if k != "ML4T_DATA_PATH"}
+          out = subprocess.run(
+              [sys.executable, "-c", "import os; print(os.environ.get('ML4T_DATA_PATH', ''))"],
+              env=env, cwd=os.environ["ML4T_PATH"], capture_output=True, text=True,
+          )
+          if not out.stdout.strip():
+              sys.exit("sitecustomize did not run at startup; every test below would skip")
+          print("startup hook ran ->", out.stdout.strip())
+          PY
+          .venv/bin/python -m pytest \
+            tests/test_data_root_anchor.py \
+            tests/test_sitecustomize_data_root.py \
+            -v --tb=short -rs
 
   # ---------------------------------------------------------------------------
   # Chapter notebook tests — inside Docker (ml4t/ml4t:latest)

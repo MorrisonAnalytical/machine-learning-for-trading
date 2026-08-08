@@ -6,8 +6,94 @@ from typing import Literal
 import polars as pl
 
 from data.exceptions import DataNotFoundError
-from utils import ML4T_DATA_PATH
+from utils import ML4T_DATA_PATH, REPO_ROOT
 from utils.data_quality import apply_max_symbols
+
+
+def _bundled(*parts: str) -> Path:
+    """Locate a dataset that ships with the repository.
+
+    ML4T_DATA_PATH defaults to ``<repo>/data``, so a clone finds these with no setup.
+    A reader who points ML4T_DATA_PATH at a directory of downloads elsewhere has moved
+    the datasets they downloaded, not the ones git delivered, so fall back to the
+    repository copy rather than raising on a file that is checked in.
+    """
+    external = ML4T_DATA_PATH.joinpath(*parts)
+    return external if external.exists() else REPO_ROOT.joinpath("data", *parts)
+
+
+# --------------------------------------------------------------------------------
+# AlgoSeek datasets
+# --------------------------------------------------------------------------------
+#
+# The book uses four AlgoSeek datasets. Three are published openly at the page below,
+# with no account and no API key; the fourth, the S&P 500 daily bars, ships inside this
+# repository by AlgoSeek's permission (see data/README.md#attribution).
+#
+# Two of the three downloads are CSV, and every loader here reads parquet, so their
+# path is download -> algoseek_convert.py -> (for the options, one build script) ->
+# loader. The trade-and-quote ticks are already parquet in the layout the loader scans
+# and only need unzipping. The instructions below are what a reader sees when a dataset
+# is missing, so they name that path rather than an address to write to.
+
+ALGOSEEK_PAGE = "https://algoseek.com/ml-for-trading/"
+ALGOSEEK_CONVERT = "data/equities/market/algoseek_convert.py"
+
+_NASDAQ100_MINUTE_BARS_INSTRUCTIONS = f"""AlgoSeek publishes this dataset for the book.
+No account, no API key, no license request.
+
+  1. Download nasdaq-100-constituents-taq-ext.zip (5.9 GB) from
+     {ALGOSEEK_PAGE}
+  2. Convert it to the layout this loader reads:
+     uv run python {ALGOSEEK_CONVERT} \\
+       --dataset nasdaq100-minute-bars --source <path to the zip>
+
+Coverage: 505 trading days, 2020-01-02 to 2021-12-31, extended-hours minute bars."""
+
+_SP500_OPTIONS_INSTRUCTIONS = f"""AlgoSeek publishes this dataset for the book.
+No account, no API key, no license request.
+
+  1. Download options_daily_greeks_sp500.zip (14.1 GB) from
+     {ALGOSEEK_PAGE}
+  2. Convert it to the layout this loader reads:
+     uv run python {ALGOSEEK_CONVERT} \\
+       --dataset sp500-options --source <path to the zip>
+
+The archive holds 1,275,314 gzipped files, so unpacking it first and pointing
+--source at the extracted directory is considerably faster than reading from
+the zip.
+
+Coverage: 1,259 trading days 2017-2021, 634 symbols, full daily chains with Greeks."""
+
+
+def _nasdaq100_taq_instructions(base_path: Path) -> str:
+    """Instructions for the ticks, which are published as parquet and need no conversion."""
+    return f"""AlgoSeek publishes this dataset for the book.
+No account, no API key, no license request.
+
+  1. Download symbol=AAPL.zip (67 MB) from
+     {ALGOSEEK_PAGE}
+  2. Unzip it into the partition this loader scans — the archive holds the two
+     date=YYYYMMDD.parquet files, not the symbol directory, so name it yourself:
+     unzip -q "symbol=AAPL.zip" "*.parquet" -d "{base_path / "symbol=AAPL"}"
+
+Naming the members matters: Dropbox writes a stray root entry into the archive,
+and unzipping without "*.parquet" warns and exits 2 having extracted them anyway.
+
+Already parquet in the layout this loader reads, so there is nothing to convert.
+
+Coverage: AAPL on 2020-03-13 and 2020-03-16, trades and NBBO quote events."""
+
+
+def _derived_from_raw_options(build_script: str) -> str:
+    """Instructions for a dataset built out of the raw option chains."""
+    return f"""This dataset is derived from the raw S&P 500 option chains.
+
+  1. Obtain the raw chains first — download options_daily_greeks_sp500.zip
+     (14.1 GB) from {ALGOSEEK_PAGE} and convert it:
+     uv run python {ALGOSEEK_CONVERT} --dataset sp500-options --source <path>
+  2. Build this dataset from them:
+     uv run python {build_script}"""
 
 
 def load_sp500_index() -> pl.DataFrame:
@@ -23,7 +109,7 @@ def load_sp500_index() -> pl.DataFrame:
         >>> sp500 = load_sp500_index()
         >>> sp500.head()
     """
-    path = ML4T_DATA_PATH / "equities" / "market" / "sp500" / "sp500.csv"
+    path = _bundled("equities", "market", "sp500", "sp500.csv")
     if not path.exists():
         msg = f"S&P 500 index data not found at {path}."
         raise FileNotFoundError(msg)
@@ -195,15 +281,7 @@ def load_nasdaq100_bars(
         raise DataNotFoundError(
             dataset_name="NASDAQ-100 Minute Bars",
             path=hive_path,
-            instructions="""This dataset requires a commercial license from AlgoSeek.
-
-To obtain the data:
-  1. Contact AlgoSeek: https://www.algoseek.com/
-  2. Request NASDAQ-100 Minute Bar data (2020-2021)
-  3. Download data to: $ML4T_DATA_PATH/algoseek/minute_nq100/
-  4. Run extraction: python data/_licensed/algoseek/nasdaq100_minute_bars.py
-
-Note: Academic pricing may be available for educational use.""",
+            instructions=_NASDAQ100_MINUTE_BARS_INSTRUCTIONS,
         )
 
     lf = pl.scan_parquet(hive_path / "**/*.parquet", hive_partitioning=True)
@@ -298,22 +376,23 @@ def load_sp500_daily_bars(
         DataFrame with columns: timestamp, symbol, open, high, low, close, volume,
         adj_factor (cumulative price factor for split adjustment)
 
-    Coverage: 2017-2021, ~638 symbols (S&P 500 + some changes)
+    Coverage: 635,703 rows, 638 symbols, 2017-01-03 to 2021-12-31.
+
+    Bundled with the repository at data/equities/market/sp500/daily_bars.parquet and
+    redistributed by permission of AlgoSeek; see data/README.md#attribution.
     """
-    path = ML4T_DATA_PATH / "equities" / "market" / "sp500" / "daily_bars.parquet"
+    path = _bundled("equities", "market", "sp500", "daily_bars.parquet")
     if not path.exists():
         raise DataNotFoundError(
             dataset_name="S&P 500 Daily Bars",
             path=path,
-            instructions="""This dataset requires a commercial license from AlgoSeek.
-
-To obtain the data:
-  1. Contact AlgoSeek: https://www.algoseek.com/
-  2. Request S&P 500 Daily OHLCV data (2017-2021)
-  3. Download data to: $ML4T_DATA_PATH/algoseek/sp500_daily/
-  4. Run extraction: python data/_licensed/algoseek/sp500_daily_bars.py
-
-Note: Academic pricing may be available for educational use.""",
+            instructions=(
+                "This dataset ships with the repository at\n"
+                "data/equities/market/sp500/daily_bars.parquet, so a missing file means\n"
+                "the checkout is incomplete rather than that a download is outstanding.\n"
+                "Restore it with:\n"
+                "  git checkout -- data/equities/market/sp500/daily_bars.parquet"
+            ),
         )
 
     lf = pl.scan_parquet(path)
@@ -406,15 +485,7 @@ def load_sp500_options(
         raise DataNotFoundError(
             dataset_name="S&P 500 Options Greeks",
             path=base_path,
-            instructions="""This dataset requires a commercial license from AlgoSeek.
-
-To obtain the data:
-  1. Contact AlgoSeek: https://www.algoseek.com/
-  2. Request S&P 500 Options Greeks data (2017-2021)
-  3. Download data to: $ML4T_DATA_PATH/algoseek/options_sp500/
-  4. Run extraction: python data/_licensed/algoseek/sp500_options.py
-
-Note: Academic pricing may be available for educational use.""",
+            instructions=_SP500_OPTIONS_INSTRUCTIONS,
         )
 
     # Use lazy scan with Hive partitioning
@@ -459,9 +530,6 @@ Note: Academic pricing may be available for educational use.""",
     return lf if lazy else lf.collect()
 
 
-_SP500_OPTIONS_S3_BASE = "https://algoseek-public.s3.amazonaws.com/ml4t/sp500_options"
-
-
 def load_sp500_options_eda(
     symbols: list[str] | None = None,
     option_type: Literal["C", "P", "all"] = "all",
@@ -495,7 +563,9 @@ def load_sp500_options_eda(
         raise DataNotFoundError(
             dataset_name="S&P 500 Options — EDA subset",
             path=base_path,
-            download_url=f"{_SP500_OPTIONS_S3_BASE}/options_eda/",
+            instructions=_derived_from_raw_options(
+                "data/equities/market/sp500/build_options_eda.py"
+            ),
         )
 
     lf = pl.scan_parquet(base_path / "year=*.parquet", hive_partitioning=True)
@@ -556,7 +626,9 @@ def load_sp500_options_straddles_raw(
         raise DataNotFoundError(
             dataset_name="S&P 500 Options — ATM-band straddle raw chains",
             path=base_path,
-            download_url=f"{_SP500_OPTIONS_S3_BASE}/options_straddles_raw.tar.zst",
+            instructions=_derived_from_raw_options(
+                "data/equities/market/sp500/build_options_straddles_raw.py"
+            ),
         )
 
     lf = pl.scan_parquet(base_path / "year=*.parquet", hive_partitioning=True)
@@ -598,6 +670,12 @@ def load_sp500_options_surface(
     qc_converged_share, term_slope_near_atm, term_slope_far_atm,
     term_ratio_atm, term_convexity, skew_to_atm_ratio.
 
+    An implied volatility is solved for, not quoted, and the vendor records a
+    failed solve as -1 rather than as a missing value. Those placeholders are
+    returned as nulls, along with every surface measure derived from one, so
+    that a caller sees a value it does not have as missing rather than as a
+    negative volatility. See ``_null_unsolved_iv``.
+
     Used by sp500_equity_option_analytics/03_financial_features.py, which
     also shows how this summary is computed from raw option chains.
     """
@@ -606,7 +684,9 @@ def load_sp500_options_surface(
         raise DataNotFoundError(
             dataset_name="S&P 500 Options — Daily IV Surface",
             path=path,
-            download_url=f"{_SP500_OPTIONS_S3_BASE}/options_surface_daily.parquet",
+            instructions=_derived_from_raw_options(
+                "data/equities/market/sp500/materialize_options.py"
+            ),
             derivation_notebook=(
                 "case_studies/sp500_equity_option_analytics/03_financial_features.py"
             ),
@@ -621,7 +701,58 @@ def load_sp500_options_surface(
     if symbols:
         df = df.filter(pl.col("symbol").is_in(symbols))
     df = apply_max_symbols(df, max_symbols)
-    return df.sort(["timestamp", "symbol"])
+    return _null_unsolved_iv(df).sort(["timestamp", "symbol"])
+
+
+#: Surface measures and the implied volatilities each one is computed from, per
+#: ``data/equities/market/sp500/materialize_options.py``. A measure is only as
+#: solved as its inputs, so nulling a placeholder has to reach the differences
+#: and ratios taken from it as well.
+_IV_LEVELS = (
+    "iv_30_atm",
+    "iv_7_atm",
+    "iv_90_atm",
+    "iv_30_put_25d",
+    "iv_30_call_25d",
+)
+_IV_DERIVED = {
+    "skew_rr_30_25d": ("iv_30_put_25d", "iv_30_call_25d"),
+    "term_slope_near_atm": ("iv_30_atm", "iv_7_atm"),
+    "term_slope_far_atm": ("iv_90_atm", "iv_30_atm"),
+    "term_ratio_atm": ("iv_90_atm", "iv_7_atm"),
+    "term_convexity": ("iv_7_atm", "iv_90_atm", "iv_30_atm"),
+    "skew_to_atm_ratio": ("iv_30_put_25d", "iv_30_call_25d", "iv_30_atm"),
+}
+
+
+def _null_unsolved_iv(df: pl.DataFrame) -> pl.DataFrame:
+    """Return a failed implied-volatility solve as a null rather than as -1.
+
+    The option chain carries one quote per contract and the implied volatility is
+    recovered from it numerically. Where that does not converge the vendor writes
+    -1, and ``materialize_options.py`` carries the placeholder through: averaging
+    an unsolved leg with a solved one leaves a value that is negative without
+    being recognisably a placeholder, and every difference and ratio taken across
+    tenors or strikes inherits it the same way.
+
+    A negative annualized standard deviation is not a quantity a caller can do
+    anything with, and it is worse than missing: it survives ``drop_nulls``, it
+    sorts to the bottom of a ranking, and it enters a mean. Normalising it here
+    means every reader of this dataset gets the same answer to what the file does
+    with failure, rather than each one rediscovering it.
+    """
+    levels = [c for c in _IV_LEVELS if c in df.columns]
+    if not levels:
+        return df
+    df = df.with_columns(pl.when(pl.col(c) > 0).then(pl.col(c)).alias(c) for c in levels)
+    derived = [
+        pl.when(pl.all_horizontal(pl.col(i).is_not_null() for i in inputs if i in levels))
+        .then(pl.col(name))
+        .alias(name)
+        for name, inputs in _IV_DERIVED.items()
+        if name in df.columns and any(i in levels for i in inputs)
+    ]
+    return df.with_columns(derived) if derived else df
 
 
 def load_sp500_options_straddles(
@@ -642,7 +773,9 @@ def load_sp500_options_straddles(
         raise DataNotFoundError(
             dataset_name="S&P 500 Options — Daily 30D ATM Straddles",
             path=path,
-            download_url=f"{_SP500_OPTIONS_S3_BASE}/options_straddles_daily.parquet",
+            instructions=_derived_from_raw_options(
+                "data/equities/market/sp500/materialize_options.py"
+            ),
             derivation_notebook="data/equities/market/sp500/materialize_options.py",
         )
     lf = pl.scan_parquet(path)
@@ -683,14 +816,14 @@ def load_nasdaq100_taq(
 ) -> pl.DataFrame:
     """Load AlgoSeek TAQ tick data for March 2020 (COVID crash period).
 
-    High-frequency tick data including trades and quotes with nanosecond
-    precision timestamps. Data covers AAPL, AMZN, MSFT during the
-    March 2020 market crash - ideal for studying market microstructure
-    during extreme volatility.
+    Individual trade and NBBO quote events at microsecond precision, on the two
+    days Chapter 3 contrasts: 2020-03-13, and the circuit-breaker session of
+    2020-03-16.
 
     Args:
-        symbols: Optional list of symbols to filter (e.g., ["AAPL"])
-                Available: AAPL, AMZN, MSFT
+        symbols: Optional list of symbols to filter. The published slice holds
+                AAPL only; the full commercial feed shares this layout, so a
+                reader with more symbols on disk can pass them here.
         event_types: Optional list of event types to filter. Available:
             - "TRADE": Executed trades
             - "TRADE NB": Non-binding trades
@@ -705,19 +838,12 @@ def load_nasdaq100_taq(
             timestamp (microsecond precision), symbol, event_type,
             price, quantity, exchange, conditions
 
-    Coverage: 21 trading days in March 2020, 3 tickers (~500M rows total)
+    Coverage: 21,284,141 events — 13,651,726 on 2020-03-13 and 7,632,415 on
+    2020-03-16 — for AAPL.
     """
     base_path = ML4T_DATA_PATH / "equities" / "market" / "microstructure" / "trade_and_quotes"
 
-    algoseek_instructions = """This dataset requires a commercial license from AlgoSeek.
-
-To obtain the data:
-  1. Contact AlgoSeek: https://www.algoseek.com/
-  2. Request Trade and Quote (TAQ) data for March 2020
-  3. Download data to: $ML4T_DATA_PATH/algoseek/taq/
-  4. Run extraction: python data/_licensed/algoseek/trade_and_quotes.py
-
-Note: Academic pricing may be available for educational use."""
+    algoseek_instructions = _nasdaq100_taq_instructions(base_path)
 
     if not base_path.exists() or not list(base_path.glob("symbol=*")):
         raise DataNotFoundError(

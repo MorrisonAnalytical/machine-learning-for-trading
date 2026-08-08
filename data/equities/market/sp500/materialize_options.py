@@ -22,20 +22,29 @@ After materialization, notebooks use:
 
 from __future__ import annotations
 
+import argparse
 import gc
 import time
 from pathlib import Path
 
 import polars as pl
 
+from utils.downloading import resolve_data_dir
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-RAW_DIR = Path(__file__).parent / "options"
-OUT_DIR = Path(__file__).parent
+def sp500_data_dir(data_path: Path | None = None) -> Path:
+    """Where the loaders read this dataset from.
 
-SURFACE_OUT = OUT_DIR / "options_surface_daily.parquet"
-STRADDLES_OUT = OUT_DIR / "options_straddles_daily.parquet"
+    Not ``Path(__file__).parent``: the converter writes under ``$ML4T_DATA_PATH``,
+    which a reader may point outside the repository, and a build script anchored
+    to its own directory would then look in the wrong place and leave its output
+    somewhere the loaders never read.
+    """
+    return resolve_data_dir(data_path) / "equities" / "market" / "sp500"
+
 
 YEARS = [2017, 2018, 2019, 2020, 2021]
 
@@ -63,10 +72,16 @@ def _select_surface_point(
     call_put: str | None = None,
 ) -> pl.DataFrame:
     """Select contract closest to target delta within DTE bucket."""
+    # The vendor writes -1 where the implied-volatility solve did not converge, so a
+    # contract whose solve failed is not a candidate for the surface point: without
+    # this the nearest-delta contract can win the rank carrying a placeholder, and
+    # every average, difference and ratio taken from it inherits one. Rows already
+    # written with a placeholder are normalised on the way in by
+    # ``data/equities/loader.py::_null_unsolved_iv``.
     filtered = df.filter(
         (pl.col("days_to_maturity").is_between(dte_bucket[0], dte_bucket[1]))
         & pl.col("delta").is_not_null()
-        & pl.col("implied_vol").is_not_null()
+        & (pl.col("implied_vol") > 0)
     )
     if call_put is not None:
         filtered = filtered.filter(pl.col("call_put") == call_put)
@@ -341,6 +356,21 @@ def compute_straddles(df: pl.DataFrame) -> pl.DataFrame:
 # Main: year-by-year processing
 # ===================================================================
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=None,
+        help="Data storage location (default: $ML4T_DATA_PATH or repo/data)",
+    )
+    args = parser.parse_args()
+
+    base = sp500_data_dir(args.data_path)
+    RAW_DIR = base / "options"
+    SURFACE_OUT = base / "options_surface_daily.parquet"
+    STRADDLES_OUT = base / "options_straddles_daily.parquet"
+    base.mkdir(parents=True, exist_ok=True)
+
     print("=" * 60)
     print("SP500 Options Materialization")
     print(f"Raw data: {RAW_DIR}")

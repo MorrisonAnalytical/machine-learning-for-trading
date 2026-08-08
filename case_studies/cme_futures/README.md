@@ -20,8 +20,8 @@ The pipeline runs a long-short carry-ranked strategy with weekly Friday-close de
 
 | Stage | Notebook | Chapter | Description | Writes |
 |-------|----------|---------|-------------|--------|
-| Feasibility | [`01_feasibility_analysis`](01_feasibility_analysis.ipynb) | Ch6 | Universe coverage, cost-vs-edge feasibility, walk-forward verification against `config/setup.yaml` | `config/exploration/feasibility_report.json` |
-| Labels | [`02_labels`](02_labels.ipynb) | Ch7 | 5-day and 21-day forward returns from ratio back-adjusted continuous data | `labels/fwd_ret_5d.parquet`, `labels/fwd_ret_21d.parquet`, `labels/fwd_tb_5d.parquet`, `config/cv_config.json` |
+| Feasibility | [`01_feasibility_analysis`](01_feasibility_analysis.ipynb) | Ch6 | Universe breadth per decision date, round-trip spread per product, move-to-spread scale, carry persistence, and the declared walk-forward folds | none |
+| Labels | [`02_labels`](02_labels.ipynb) | Ch7 | 5-day and 21-day forward returns from ratio back-adjusted continuous data | `labels/fwd_ret_5d.parquet`, `labels/fwd_ret_21d.parquet`, each with a `.digest.json` sidecar |
 | Features | [`03_financial_features`](03_financial_features.ipynb) | Ch8 | Term structure, carry, momentum, and roll-return features | `features/financial.parquet` |
 | Temporal | [`04_model_based_features`](04_model_based_features.ipynb) | Ch9 | Expanding-window ARIMA and HMM features via statsforecast | `features/model_based.parquet` |
 | Evaluation | [`05_evaluation`](05_evaluation.ipynb) | Ch7-9 | Feature-label IC diagnostics across 30 products and 7 sectors | `evaluation/triage_ledger.parquet`, `evaluation/ic_timeseries.parquet` |

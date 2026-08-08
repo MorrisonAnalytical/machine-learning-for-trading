@@ -61,11 +61,31 @@ uv sync
 
 # Run a notebook
 uv run python 11_ml_pipeline/01_ols_inference.py
+
+# Or start Jupyter Lab, from the repo root, and open the URL it prints
+ML4T_DATA_PATH="${ML4T_DATA_PATH:-$PWD/data}" uv run jupyter lab
 ```
+
+A local Jupyter Lab generates an access token on each start and prints the address with the token
+attached:
+
+```
+http://localhost:8888/lab?token=ef2600091d6010aa5e7f044172907ebf893f16f5d1aaa851
+```
+
+Open that whole line, not a bare `http://localhost:8888`, which only shows a token prompt. On
+Windows the server runs inside WSL2 and no browser opens by itself, so copy the URL into your normal
+Windows browser; WSL2 forwards `localhost` for you.
+
+`uv sync` installs Jupyter Lab, so no separate install is needed. The `ML4T_DATA_PATH` prefix gives
+the data loaders an absolute path: Jupyter runs each notebook with its own chapter folder as the
+working directory, and without it they look for `01_process_is_edge/data/…` and report the data as
+missing. The form above keeps a value you already exported and falls back to the repository's own
+`data/` only when you have not set one. If you keep the datasets elsewhere, export that path in your
+shell profile - setting it in `.env` alone is not enough, because `uv run` does not read `.env`.
 
 **Platform notes for local setup:**
 - **Python 3.14+** required
-- **TA-Lib** must be installed separately ([instructions](https://ta-lib.github.io/ta-lib-python/install.html))
 - **GPU**: PyTorch auto-detects CUDA if NVIDIA drivers are installed
 - **Apple Silicon**: Most packages have native ARM64 wheels; the py312 notebooks above cannot run on ARM64 — view their pre-executed `.ipynb` files instead
 
@@ -73,9 +93,12 @@ uv run python 11_ml_pipeline/01_ols_inference.py
 
 ## Your First Notebook
 
-If you started Jupyter Lab with `docker compose up ml4t`, open
-**http://localhost:8888** in your web browser. The repository's file tree appears
-on the left.
+Once Jupyter Lab is running - `docker compose up ml4t` on the Docker path, or
+`ML4T_DATA_PATH="${ML4T_DATA_PATH:-$PWD/data}" uv run jupyter lab` from the repo
+root on the local path - open it in your web browser: **http://localhost:8888**
+for Docker, and for the local path the tokenized URL the server printed. The
+repository's file tree appears on the left. On Windows, start it inside your WSL2
+Ubuntu terminal and open the address in your normal Windows browser.
 
 1. In the file browser (left panel), open a chapter folder — e.g.
    `01_process_is_edge` — and **double-click** a `.ipynb` file to open it.
@@ -113,7 +136,10 @@ uv run python 11_ml_pipeline/01_ols_inference.py
 docker compose run --rm ml4t python 11_ml_pipeline/01_ols_inference.py
 ```
 
-**Important**: Always run from the repository root. Running from a subdirectory will fail with `ImportError: No module named 'utils'`.
+**Important**: Run `.py` notebooks from the repository root. The data loaders resolve `data/` relative
+to the working directory, so running from a chapter folder reports the datasets as missing even when
+they are downloaded. Setting `ML4T_DATA_PATH` to an absolute path removes the constraint, which is
+why the Jupyter Lab command above sets it.
 
 ---
 
@@ -496,7 +522,13 @@ Some datasets require API keys (set in `.env`):
 - **OANDA** (FX pairs): Free API key from [oanda.com](https://www.oanda.com/)
 - **NASDAQ Data Link** (US equities): Free API key from [data.nasdaq.com](https://data.nasdaq.com/)
 - **Databento** (CME futures): $125 free signup credit from [databento.com](https://databento.com/)
-- **AlgoSeek** (microstructure, options): Requires commercial license
+
+**AlgoSeek** (NASDAQ-100 minute bars, S&P 500 option chains, NASDAQ-100 TAQ ticks) needs no key and
+no account. Download the archives from
+[algoseek.com/ml-for-trading](https://algoseek.com/ml-for-trading/); the two large ones convert once
+and the ticks only need unzipping — see [AlgoSeek datasets](../data/README.md#algoseek-datasets).
+The fourth AlgoSeek dataset the book uses, the S&P 500 daily bars, ships with this repository, so
+there is nothing to download or configure for it.
 
 ---
 
@@ -563,16 +595,25 @@ Test parameter overrides are defined in `tests/overrides.yaml`, keyed by noteboo
 ```yaml
 # Example entries
 11_ml_pipeline/01_ols_inference:
-  timeout: 180
-  parameters:
-    MAX_SYMBOLS: 15
-
-case_studies/etfs/07_gbm:
   timeout: 300
   parameters:
-    MAX_SYMBOLS: 15
-    START_DATE: "2020-01-01"
+    MAX_SYMBOLS: 10
+    MAX_TRAIN_ROWS: 5000
+
+case_studies/etfs/07_gbm:
+  timeout: 180
+  parameters:
+    MAX_FOLDS: 2
+    MAX_SYMBOLS: 5
 ```
+
+Papermill injects these values in a cell placed right after the notebook's
+`# %% tags=["parameters"]` cell, so each name has to be one the notebook reads
+below that point and does not overwrite before reading. Anything else is either
+an unused variable or is discarded before it is used.
+`tests/test_pm_helpers.py` rejects names that fail either condition, so a
+mistyped or renamed parameter turns the build red instead of quietly running the
+notebook at full scale.
 
 **To customize for your machine**: copy `tests/overrides.yaml` to `tests/overrides.local.yaml` (gitignored) and adjust timeouts or parameter values. The test runner checks for the local file first.
 

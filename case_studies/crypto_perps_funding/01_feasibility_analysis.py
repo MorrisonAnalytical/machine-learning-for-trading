@@ -14,797 +14,623 @@
 # ---
 
 # %% [markdown]
-# # Crypto Perpetuals Funding Case Study: Feasibility Analysis
+# # Crypto Perpetuals Funding: Feasibility Analysis
 #
-# This notebook tests whether the crypto perpetuals dataset can deliver on the
-# strategy declared in `config/setup.yaml`. `setup.yaml` is the canonical,
-# hand-curated source of truth: universe, costs, decision schedule, mapping
-# class, labels, sweep grid, and evaluation protocol. This notebook does not
-# write it. Instead, it produces the evidence that justifies its values:
-# price-move scale at multiple horizons relative to taker/maker fees,
-# premium-index autocorrelation, and a walk-forward
-# fold demonstration. Findings persist to
-# `config/exploration/feasibility_report.json`.
+# Before building a trading strategy it is worth asking whether the data can support one at all.
+# This notebook does that and nothing else: it fits no model and makes no forecast.
 #
-# ## Learning Objectives
+# The strategy being checked is described in `config/setup.yaml`. It trades perpetual futures on
+# Binance, sorts them every eight hours by how expensive it currently is to hold each one long, and
+# buys one end of that ordering while selling the other. That file says which contracts it trades,
+# when it is allowed to change positions, what a trade is assumed to cost, and how the history is
+# divided between designing the strategy and testing it. This notebook checks each of those
+# assumptions against the data and reports what it finds.
 #
-# - Verify the data delivers what `setup.yaml` assumes (universe, holdout, cadence)
-# - Compare price-move scale with maker/taker fees without treating movement as edge
-# - Quantify premium-index persistence and its impact on naive sample-size claims
-# - Demonstrate the walk-forward structure carries adequate per-fold breadth
-# - Persist findings as a stable artifact downstream notebooks can cite
+# ## Learning objectives
 #
-# ## Book Reference
+# By the end of this notebook you will be able to:
 #
-# Chapter 6, Sections 6.2-6.6
+# - Count the members of a panel whose entities start at different dates, at the moments a strategy
+#   is allowed to trade, and compare that count against the number of positions it wants to hold
+# - Read off one chart what fraction of price moves are larger than the fee charged to capture them
+# - Measure how long a per-contract quantity keeps describing the same contract, computing the
+#   correlation inside each contract rather than across contracts stacked into one series
+# - Turn that persistence into the number of independent observations a sample holds, which is
+#   smaller than the number of rows it contains
+# - Check that a walk-forward split of the history fits the sample available and leaves the test
+#   period unread
+#
+# ## Book reference
+#
+# Chapter 6, Sections 6.2-6.6. This notebook reads Binance perpetual bars and `config/setup.yaml`,
+# and writes nothing.
 #
 # ## Prerequisites
 #
-# - Crypto perpetuals data via `load_crypto_perps()` and `load_crypto_premium()`
-# - `config/setup.yaml` exists (canonical strategy spec)
-# - Understanding of walk-forward cross-validation (Section 6.5)
+# None beyond what the sections below define. A reader who has not traded a perpetual future or
+# split a sample for walk-forward evaluation will find both explained where they are first used.
 
 # %%
-"""Crypto Perpetuals Funding Case Study: Feasibility Analysis."""
+"""Crypto Perpetuals Funding Case Study - Feasibility Analysis."""
 
-import json
+import re
 import warnings
-from datetime import date, timedelta
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import polars as pl
 import yaml
-from statsmodels.tsa.stattools import acf
+from IPython.display import display
 
-from data import load_crypto_perps, load_crypto_premium
+from case_studies.utils.feasibility import exceedance_curve, fold_timeline, panel_acf
+from data import load_crypto_perps
 from utils.cv_splits import generate_cv_splits
-from utils.paths import display_path, get_case_study_dir
-from utils.style import COLORS, FIGSIZE
+from utils.paths import get_case_study_dir
+from utils.style import COLORS, FIGSIZE, add_message_title, zero_line
 
 warnings.filterwarnings("ignore")
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "crypto_perps_funding"
 START_DATE = "2020-01-01"
+END_DATE = "2025-12-31"
 MAX_SYMBOLS = 0
 
 # %% [markdown]
 # ## Configuration
+#
+# Everything the strategy assumes is declared in `config/setup.yaml`, and this notebook reads those
+# values rather than repeating them, so the two can never disagree. Four groups of settings matter
+# here, and each one decides something the sections below test.
+#
+# **How the history is divided.** The sample runs from 2020 to the end of 2025. The last two years
+# are the *holdout*: a stretch of history that is not looked at while the strategy is being
+# designed, so that when it is finally evaluated there, the result is not a rehearsal of choices
+# already tuned on the same data. Everything computed in this notebook uses the earlier part,
+# called the development period. `holdout_start` is where the line falls.
+#
+# **What the strategy trades.** `setup.yaml` names 19 contracts. They do not all exist for the whole
+# sample: a perpetual starts when the venue lists it and has no history before that, so the panel is
+# *unbalanced* and its width is something to measure rather than assume. The strategy holds both
+# ends of its ranking, up to 10 contracts per side, so at least 20 have to be quoting whenever it
+# rebalances. That floor comes from the grid of book sizes the strategy will later search over, not
+# from a separate assumption.
+#
+# **When it is allowed to act.** `decision.cadence` puts every decision on the venue's eight-hour
+# funding schedule, three times a day. This is an information schedule rather than a parameter to
+# tune: a new observation of what the strategy ranks on exists only when a funding period settles.
+#
+# **What a trade is assumed to cost.** A flat exchange fee, quoted in basis points and charged on
+# each side of a round trip, in two tiers. Unlike a bid-ask spread it is published by the venue
+# rather than measured from the data, and Section B.3 compares it against the moves it is charged
+# on.
 
 # %%
-CASE_DIR = get_case_study_dir("crypto_perps_funding")
-CASE_DIR.mkdir(parents=True, exist_ok=True)
-EXPLORATION_DIR = CASE_DIR / "config" / "exploration"
-EXPLORATION_DIR.mkdir(parents=True, exist_ok=True)
+CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
+SETUP = yaml.safe_load((CASE_DIR / "config" / "setup.yaml").read_text())
 
-with open(CASE_DIR / "config" / "setup.yaml") as f:
-    SETUP = yaml.safe_load(f)
-
-STRATEGY_ID = SETUP["strategy_id"]
-START_DATE = "2020-01-01"
-END_DATE = "2025-12-31"
 HOLDOUT_START = str(SETUP["evaluation"]["holdout_start"])
 HOLDOUT_END = str(SETUP["evaluation"]["holdout_end"])
-RESEARCH_END = (date.fromisoformat(HOLDOUT_START) - timedelta(days=1)).isoformat()
-
-# Cost tiers declared in setup.yaml::costs.fee_schedule (per-trade bps).
-MAKER_BPS = int(SETUP["costs"]["fee_schedule"]["maker_bps"])
-TAKER_BPS = int(SETUP["costs"]["fee_schedule"]["taker_bps"])
-MAJORS_RT = 2 * MAKER_BPS / 1e4  # majors clear at maker, round-trip
-ALTS_RT = 2 * TAKER_BPS / 1e4  # alts pay taker, round-trip
-
-# %% [markdown]
-# ---
-#
-# ## Section A: Orientation (Section 6.2)
-#
-# Crypto perpetuals trade 24/7 with funding payments every eight hours at
-# 00:00, 08:00, and 16:00 UTC. Funding is a payoff component, not a cost:
-# longs pay shorts when funding is positive, shorts pay longs when negative.
-# The case study uses premium-index persistence and cross-sectional dispersion
-# to predict subsequent perpetual price returns.
-#
-# `setup.yaml` declares the trading setup. This notebook asks whether the data
-# delivers on those declarations:
-#
-# - **Universe**: Are the declared perps populated continuously enough to
-#   support a long-short strategy?
-# - **Costs**: Is the market's 8-hour price-move scale large relative to the
-#   maker (majors) and taker (alts) round-trip cost tiers?
-# - **Evaluation**: Do walk-forward folds cover the declared periods and
-#   acknowledge the dependence in the premium series?
-# - **Holdout**: Is the holdout cleanly separated from validation data?
-
-# %% [markdown]
-# ---
-#
-# ## Section B: Universe and Cost Feasibility (Sections 6.3-6.4)
-
-# %% [markdown]
-# ### B.1 Load and Verify the Data
-#
-# `load_crypto_premium()` returns 8-hour premium-index bars used by the feature
-# pipeline. The universe is
-# the panel of perpetual contracts that appears in the dataset; it is
-# unbalanced because newer perps (APT, SUI, INJ) entered the dataset
-# after their listing dates and have no backfill.
-
-# %%
-crypto_data = load_crypto_premium(max_symbols=MAX_SYMBOLS)
-
-if crypto_data is None or len(crypto_data) == 0:
-    raise ValueError(
-        "Crypto premium data not available. Run data/download_all.py --datasets crypto."
-    )
-
-start_dt = pl.lit(START_DATE).str.to_date("%Y-%m-%d")
-end_dt = pl.lit(END_DATE).str.to_date("%Y-%m-%d")
-
-prices = crypto_data.filter(pl.col("timestamp").dt.date().is_between(start_dt, end_dt)).sort(
-    ["symbol", "timestamp"]
+HOLDOUT_TS = pl.lit(HOLDOUT_START).str.to_datetime().dt.replace_time_zone("UTC")
+PRIMARY_LABEL, LABEL_BUFFER = SETUP["labels"]["primary"], SETUP["labels"]["buffer"]
+DECLARED = set(SETUP["universe"]["symbols"])
+BREADTH_FLOOR = 2 * max(SETUP["backtest"]["sweep"]["top_k_grid"][PRIMARY_LABEL])
+BAR_HOURS = int(SETUP["decision"]["cadence"].split("_")[0])
+HORIZONS = sorted(
+    int(re.search(r"(\d+)h$", name).group(1))
+    for name in (PRIMARY_LABEL, *SETUP["labels"]["variants"])
+    if name.startswith("fwd_ret")
 )
-holdout_start = pl.lit(HOLDOUT_START).str.to_datetime().dt.replace_time_zone("UTC")
-research_prices = prices.filter(pl.col("timestamp") + pl.duration(hours=8) < holdout_start)
-assert research_prices.select(
-    (pl.col("timestamp").max() + pl.duration(hours=8) < holdout_start).alias("sealed")
-).item(), "Premium close availability must remain strictly before holdout"
+MAKER_RT, TAKER_RT = (2 * SETUP["costs"]["fee_schedule"][k] for k in ("maker_bps", "taker_bps"))
+MAJORS = set(SETUP["features"]["majors"])
+PREMIUM = "premium_index_close"
+AVAILABLE = pl.col("timestamp") + pl.duration(hours=BAR_HOURS)  # a bar is known when it closes
+ACF_LAGS = 21 * 24 // BAR_HOURS  # settlements in three weeks, the span Section B.4 draws
 
-n_symbols = prices["symbol"].n_unique()
-SYMBOLS = prices["symbol"].unique().sort().to_list()
-print(f"Loaded {n_symbols} crypto perpetuals, {len(prices):,} rows")
-print(f"Period: {prices['timestamp'].min()} to {prices['timestamp'].max()}")
-print(f"Design statistics end before sealed holdout: {RESEARCH_END}")
+print(f"Sample: {START_DATE} to {END_DATE}")
+print(f"  Development period, used everywhere below:  {START_DATE} to {HOLDOUT_START}")
+print(f"  Holdout, not read by this notebook:         {HOLDOUT_START} to {HOLDOUT_END}")
+print(f"Universe: {len(DECLARED)} perpetual contracts declared")
+print(
+    f"  Up to {BREADTH_FLOOR // 2} held per side, so at least {BREADTH_FLOOR} must be quoting at a "
+    f"settlement to fill both legs"
+)
+print(
+    f"Decision times: every {BAR_HOURS} hours on the funding schedule, "
+    f"{24 // BAR_HOURS} a day, execution at the settlement itself"
+)
+print(
+    f"Assumed cost: {MAKER_RT} bps round trip at the maker tier, {TAKER_RT} bps at the taker tier"
+)
+print(
+    f"Forecast horizons: {' and '.join(f'{h} hours' for h in HORIZONS)} ahead; {HORIZONS[0]} hours "
+    f"is the primary horizon and sets the gap that separates training from validation"
+)
 
 # %% [markdown]
-# ### B.2 Universe Composition
+# ## A. Orientation
 #
-# The implemented universe is the fixed 19-symbol list in
-# `setup.yaml::universe.symbols`. Each selected contract becomes available
-# only from its first observed listing date, so the panel does not backfill
-# late listings.
+# ### What a perpetual future is
 #
-# This protects the time axis from pre-listing rows, but it is not a
-# point-in-time liquidity universe. The list was selected with later
-# information about which contracts remained available. Results therefore
-# retain universe-selection and delisting bias unless a historical eligibility
-# series replaces the fixed list.
+# An ordinary futures contract has an expiry date, and its price is pulled towards the price of what
+# it tracks as that date approaches, because on the day itself the two have to agree. A *perpetual*
+# future never expires, so nothing pulls it back on its own. The venue supplies the force instead.
+# Every eight hours it compares the contract's price against an *index price* built from spot markets
+# on several exchanges, and whichever side of the contract is on the expensive end of that comparison
+# pays the other. That payment is called *funding*, the moment it settles is the *funding timestamp*,
+# and the running measure the payment is computed from is the *premium index*.
+#
+# The premium index takes both signs. It is positive when the contract trades above the index it
+# tracks, which is what happens when leveraged buyers crowd in, and negative when it trades below.
+# Funding is a transfer between the two sides of the contract rather than a fee the venue keeps, so
+# it is not a trading cost: it is what the crowded side pays the other side for the privilege.
+#
+# ### Why ranking contracts is a strategy at all
+#
+# This strategy does not collect that transfer. It reads the premium as a statement about crowding -
+# a contract whose longs are paying heavily to stay long is one that a lot of borrowed money is
+# leaning on - and bets on what the price does next rather than on the payment itself. Every eight
+# hours it sorts the contracts it can trade by their premium, buys one end of the ordering and sells
+# the other, and holds until the following settlement. Whether the ordering carries any information
+# is a question for Chapter 7 onwards; what this notebook asks is whether the data could support the
+# attempt.
+#
+# A strategy of that shape needs breadth more than it needs depth. Choosing ten contracts out of six
+# is not a choice, so it matters more that many contracts are quoting at once than that any one of
+# them is quoting well.
+#
+# ### The three questions this notebook asks
+#
+# 1. **Does the universe exist when the strategy trades?** Positions change at every settlement, so
+#    enough contracts have to be quoting at each of those moments to fill both sides of the book.
+# 2. **Is a typical price move worth more than the fee charged to capture it?** Every round trip pays
+#    the exchange fee twice, and that fee is the same fraction of the price for every contract.
+# 3. **Is there enough independent history to evaluate this honestly?** Enough to split into training
+#    and validation periods more than once, with the holdout left untouched - and rows are not the
+#    same thing as independent observations when consecutive readings resemble each other.
+
+# %% [markdown]
+# ## B. Universe and cost feasibility
+#
+# ### B.1 Load and verify the declared universe
+#
+# The loader aggregates raw hourly bars onto the funding grid, so one row is one contract at one
+# settlement, labelled at the bar's opening timestamp. That timestamp moves onto the availability
+# clock once, here, and the seal, the folds and the horizons all read it. The panel is unbalanced.
 
 # %%
-listing_summary = (
-    prices.group_by("symbol")
+bars = load_crypto_perps(
+    frequency=f"{BAR_HOURS}h", start_date=START_DATE, end_date=END_DATE, max_symbols=MAX_SYMBOLS
+)
+bars = bars.with_columns(AVAILABLE).sort(["symbol", "timestamp"])
+research = bars.filter(pl.col("timestamp") < HOLDOUT_TS)
+
+loaded = set(research["symbol"].unique().to_list())
+assert not loaded - DECLARED, f"in the data, undeclared in setup.yaml: {sorted(loaded - DECLARED)}"
+print(
+    f"{len(loaded)} of {len(DECLARED)} declared contracts, {len(research):,} funding bars, "
+    f"{research['timestamp'].min().date()} to {research['timestamp'].max().date()}"
+)
+
+# %% [markdown]
+# Nineteen tickers are a list, not a description. The table below groups them the way the cost model
+# already does. `costs.fee_schedule` charges two tiers, and `features.majors` names the five
+# contracts that clear at the cheaper one; everything else pays the taker fee. That assignment comes
+# from which contracts carry the most volume rather than from anything measured here, and the
+# turnover column is the check on it.
+#
+# Three columns describe each contract. *First settlement* is the earliest funding bar in the
+# development window, which for most of these is the date the venue listed the contract rather than
+# the start of the sample. *Settled share* is the fraction of the eight-hour slots between that date
+# and the end of the development window for which a bar exists, so a value below one means the
+# contract has holes in its history - Section B.3 has to work around exactly those. *Median premium*
+# is the middle value of the quantity the strategy ranks on, in basis points of the index the
+# contract tracks, which shows both its typical sign and how far the contracts differ from one
+# another.
+
+# %%
+LAST_SETTLEMENT = research["timestamp"].max()
+slots_since_listing = (
+    (pl.lit(LAST_SETTLEMENT) - pl.col("listed")).dt.total_hours() // BAR_HOURS
+) + 1
+roster = (
+    research.with_columns(turnover=pl.col("close") * pl.col("volume"))
+    .group_by("symbol")
     .agg(
-        pl.col("timestamp").min().alias("first_bar"),
-        pl.col("timestamp").max().alias("last_bar"),
-        pl.col("timestamp").count().alias("n_bars"),
+        pl.col("timestamp").min().alias("listed"),
+        pl.len().alias("settlements"),
+        pl.col(PREMIUM).median().mul(1e4).alias("median_premium"),
+        pl.col("turnover").median().alias("median_turnover"),
     )
-    .sort("first_bar")
-)
-listing_summary
-
-# %% [markdown]
-# The declared universe in `setup.yaml::universe.symbols` should match the
-# loaded panel.
-
-# %%
-declared_symbols = sorted(SETUP["universe"]["symbols"])
-loaded_symbols = sorted(SYMBOLS)
-missing_in_data = sorted(set(declared_symbols) - set(loaded_symbols))
-extra_in_data = sorted(set(loaded_symbols) - set(declared_symbols))
-print(f"Declared in setup.yaml: {len(declared_symbols)} symbols")
-print(f"Loaded from data:       {len(loaded_symbols)} symbols")
-if missing_in_data:
-    print(f"  Declared but absent in data: {missing_in_data}")
-if extra_in_data:
-    print(f"  In data but not declared:    {extra_in_data}")
-
-# %% [markdown]
-# ---
-#
-# ### B.3 Market-Move Scale Relative to Fees
-#
-# Using only the pre-holdout research period, we compute absolute returns at
-# 1h, 4h, 8h, and daily horizons and compare
-# their scale with maker (majors) and taker (alts) round-trip fees. This is a
-# market-capacity diagnostic, not a profitability test: an absolute move is
-# not a forecastable return, and only a model-driven backtest can establish
-# whether gross edge survives turnover and costs.
-
-# %%
-perps_1h = load_crypto_perps(frequency="1h", start_date=START_DATE, end_date=RESEARCH_END)
-perps_1h = perps_1h.filter(pl.col("symbol").is_in(SYMBOLS)).sort(["symbol", "timestamp"])
-
-# %% [markdown]
-# The resampling helper converts the hourly close series into non-overlapping
-# holding-period returns while preserving each contract's own time series.
-
-# %%
-
-
-def _seal_return_endpoints(df: pl.DataFrame, hours: int) -> pl.DataFrame:
-    return df.filter(pl.col("timestamp") + pl.duration(hours=hours) < holdout_start)
-
-
-def _resample(df: pl.DataFrame, every: str, hours: int) -> pl.DataFrame:
-    return (
-        df.group_by_dynamic(
-            "timestamp", every=every, period=every, by="symbol", closed="left", label="left"
-        )
-        .agg(pl.col("close").last())
-        .sort(["symbol", "timestamp"])
-        .with_columns(
-            (pl.col("close") / pl.col("close").shift(1) - 1).over("symbol").alias("return")
-        )
-        .filter(pl.col("return").is_not_null())
-        .pipe(_seal_return_endpoints, hours)
+    .with_columns(
+        pl.when(pl.col("symbol").is_in(MAJORS))
+        .then(pl.lit("maker"))
+        .otherwise(pl.lit("taker"))
+        .alias("fee_tier"),
+        (pl.col("settlements") / slots_since_listing).alias("settled_share"),
     )
-
-
-# %%
-returns_1h = (
-    perps_1h.with_columns(
-        (pl.col("close") / pl.col("close").shift(1) - 1).over("symbol").alias("return")
+    .select(
+        "fee_tier",
+        "symbol",
+        pl.col("listed").dt.date().alias("first_settlement"),
+        "settlements",
+        pl.col("settled_share").round(3),
+        pl.col("median_premium").round(1).alias("median_premium_bps"),
+        (pl.col("median_turnover") / 1e6).round(1).alias("median_turnover_musd"),
     )
-    .filter(pl.col("return").is_not_null())
-    .pipe(_seal_return_endpoints, 1)
+    .sort(["fee_tier", "first_settlement", "symbol"])
 )
-returns_4h = _resample(perps_1h, "4h", 4)
-returns_8h = _resample(perps_1h, "8h", 8)
-returns_daily = _resample(perps_1h, "1d", 24)
-
-assert returns_1h.select(
-    (pl.col("timestamp").max() + pl.duration(hours=1) < holdout_start).alias("sealed")
-).item()
-assert returns_8h.select(
-    (pl.col("timestamp").max() + pl.duration(hours=8) < holdout_start).alias("sealed")
-).item()
-
-print(f"1h returns:    {len(returns_1h):,} observations")
-print(f"4h returns:    {len(returns_4h):,} observations")
-print(f"8h returns:    {len(returns_8h):,} observations")
-print(f"Daily returns: {len(returns_daily):,} observations")
-
-# %%
-abs_1h = returns_1h["return"].abs().to_numpy()
-abs_4h = returns_4h["return"].abs().to_numpy()
-abs_8h = returns_8h["return"].abs().to_numpy()
-abs_daily = returns_daily["return"].abs().to_numpy()
+with pl.Config(tbl_rows=roster.height, tbl_cols=roster.width, tbl_width_chars=200):
+    display(roster)
 
 # %% [markdown]
-# The summary keeps exact values for the report while the figure below shows
-# the economically relevant comparison.
-
-# %%
-
-
-def _horizon_stats(data: np.ndarray, label: str) -> dict:
-    return {
-        "horizon": label,
-        "median_pct": float(np.median(data) * 100),
-        "p75_pct": float(np.percentile(data, 75) * 100),
-        "p95_pct": float(np.percentile(data, 95) * 100),
-        "pct_above_majors": float((data > MAJORS_RT).mean() * 100),
-        "pct_above_alts": float((data > ALTS_RT).mean() * 100),
-    }
-
-
-# %%
-horizon_stats = pl.DataFrame(
-    [
-        _horizon_stats(abs_1h, "1-Hour"),
-        _horizon_stats(abs_4h, "4-Hour"),
-        _horizon_stats(abs_8h, "8-Hour"),
-        _horizon_stats(abs_daily, "Daily"),
-    ]
-)
-
-# %% [markdown]
-# #### Price-Move Scale Is Necessary, Not Sufficient
+# ### B.2 Breadth at every funding timestamp
 #
-# The left panel expresses the median absolute move as a multiple of the more
-# conservative alts round-trip fee. The right panel shows how often absolute
-# moves exceed each fee tier. Neither panel says those moves are predictable.
+# A single count over the whole sample would hide the question a strategy of this shape has to
+# answer, which is how many contracts are quoting *at the moment it has to choose between them*.
+# The reference line is the number the largest entry in `backtest.sweep.top_k_grid` requires: ten
+# positions on each side, so twenty contracts quoting at once. Where breadth is below that line, the
+# strategy cannot fill the book it declares, and it would have to hold fewer names or drop that grid
+# entry.
 
 # %%
-plot_stats = horizon_stats.with_columns(move_to_alts_cost=pl.col("median_pct") / (ALTS_RT * 100))
-labels = plot_stats["horizon"].to_list()
-focus_colors = [COLORS["blue"] if label == "8-Hour" else COLORS["neutral"] for label in labels]
+breadth = research.group_by("timestamp").agg(n=pl.col("symbol").n_unique()).sort("timestamp")
 
-fig, axes = plt.subplots(2, 1, figsize=FIGSIZE["dual_v"], sharex=True)
-axes[0].bar(labels, plot_stats["move_to_alts_cost"], color=focus_colors)
-axes[0].axhline(1.0, color=COLORS["amber"], linestyle="--", label="One alts round trip")
-axes[0].set_title("Median absolute move / 8 bps round-trip fee")
-axes[0].set_ylabel("Multiple")
-axes[0].legend()
-
-x = np.arange(len(labels))
-width = 0.36
-axes[1].bar(
-    x - width / 2,
-    plot_stats["pct_above_majors"],
-    width,
-    color=COLORS["blue"],
-    label=f"Majors ({MAJORS_RT * 1e4:.0f} bps)",
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+ax.plot(breadth["timestamp"], breadth["n"], color=COLORS["blue"], lw=1.0)
+ax.axhline(
+    BREADTH_FLOOR, color=COLORS["copper"], ls="--", lw=1.5, label="contracts the largest book needs"
 )
-axes[1].bar(
-    x + width / 2,
-    plot_stats["pct_above_alts"],
-    width,
-    color=COLORS["amber"],
-    label=f"Alts ({ALTS_RT * 1e4:.0f} bps)",
+ax.set_ylim(0, BREADTH_FLOOR + 2)
+ax.set_yticks(range(0, BREADTH_FLOOR + 3, 5))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.set_ylabel("Contracts quoting at the funding timestamp")
+ax.legend(frameon=False, fontsize=8, loc="lower right")
+add_message_title(
+    ax,
+    "The universe never fills the largest book the strategy may hold",
+    subtitle="Perpetuals with a settled funding bar at each timestamp, against the 20 a top-10 book needs",
 )
-axes[1].set_xticks(x, labels)
-axes[1].set_ylim(0, 100)
-axes[1].set_title("Share of absolute moves above one round-trip fee")
-axes[1].set_ylabel("Observations (%)")
-axes[1].legend()
-
-fig.suptitle("Price moves widen with horizon, but movement is not an edge")
-fig.supxlabel("Holding horizon")
-fig.tight_layout()
 plt.show()
 
 # %% [markdown]
-# #### Interpretation
+# ### B.3 What a move is worth against the fee
 #
-# - **1h / 4h**: Sub-settlement decisions increase potential turnover without
-#   adding a new premium-index observation at the eight-hour schedule.
-# - **8h (funding-aligned)**: The natural information cadence. Each decision
-#   incorporates one completed premium-index bar, and 96% of absolute price
-#   moves exceed the alts round-trip fee.
-# - **Daily**: A daily position remains open across three funding settlements;
-#   it does not miss their cash flows. It updates the signal only once rather
-#   than at each new eight-hour observation.
+# `setup.yaml::costs.fee_schedule` charges a flat fee per trade in two tiers rather than a
+# per-contract spread, so cost here is a level the venue publishes, not something this data
+# measures. The question is what fraction of price moves are larger than that fee, at each horizon
+# the labels will be built at.
 #
-# The 8-hour cadence is therefore not a hyperparameter to sweep; it is a
-# **structural information schedule**. Daily is retained as a variant horizon
-# for testing slower signal decay. Profitability remains unresolved here.
-
-# %% [markdown]
-# ### B.4 Market-Move-to-Cost Ratio
+# The chart below is an *exceedance curve*: at each move size on the horizontal axis it shows the
+# fraction of moves that were at least that large. Reading up from the round-trip fee gives the
+# share of moves big enough to pay for themselves. The moves are unsigned, so this measures how much
+# the price travels, not how much of that travel a strategy could capture - the second is a question
+# about forecasting, and Chapter 7 is where it starts.
 #
-# The ratio below compares market movement with the conservative alts fee.
-# Calling it an edge-to-cost ratio would be incorrect because the numerator
-# is an unsigned realized move, not a forecast or portfolio return.
+# Two details of the construction matter. This case study declares no eligibility rule - the
+# contract list in `setup.yaml` is fixed - so the population is every settlement in the panel rather
+# than a filtered subset of it. And a move counts only when the bar it ends on sits exactly one
+# horizon ahead. The table in B.1 shows contracts with holes in their history, so the endpoint is
+# matched by timestamp rather than by row position, which keeps a three-day gap out of the
+# eight-hour distribution.
 
 # %%
-median_8h_abs = float(np.median(abs_8h))
-move_to_cost_ratio_8h = median_8h_abs / ALTS_RT
-print(f"Median 8h |return|: {median_8h_abs:.4f} ({median_8h_abs * 1e4:.1f} bps)")
-print(f"Alts round-trip cost: {ALTS_RT:.4f} ({ALTS_RT * 1e4:.0f} bps)")
-print(f"Market-move-to-cost ratio (8h, alts tier): {move_to_cost_ratio_8h:.1f}x")
-print("Assessment: price variation is sufficient for modeling; tradable edge remains untested")
+moves = bars
+for h in HORIZONS:
+    endpoint = pl.col("timestamp") + pl.duration(hours=h)
+    ahead = pl.col("close").shift(-h // BAR_HOURS).over("symbol")
+    on_grid = pl.col("timestamp").shift(-h // BAR_HOURS).over("symbol") == endpoint
+    known = endpoint < HOLDOUT_TS
+    moves = moves.with_columns(
+        pl.when(on_grid & known).then((ahead / pl.col("close") - 1).abs() * 1e4).alias(f"h{h}")
+    )
+
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+for h, color in zip(HORIZONS, (COLORS["blue"], COLORS["amber"]), strict=True):
+    magnitude, fraction = exceedance_curve(moves[f"h{h}"].drop_nulls().to_numpy())
+    ax.plot(magnitude, fraction, color=color, lw=1.6, label=f"{h}-hour move")
+ax.axvline(MAKER_RT, color=COLORS["neutral"], ls=":", lw=1.5, label="maker round trip")
+ax.axvline(TAKER_RT, color=COLORS["copper"], ls="--", lw=1.5, label="taker round trip")
+ax.set_xscale("log")
+ax.set_xlim(left=1)
+ax.set_xlabel("Absolute move (bps, log scale)")
+ax.set_ylabel("Fraction of moves at least this large")
+ax.legend(frameon=False, fontsize=8, loc="lower left")
+add_message_title(
+    ax,
+    "Moves at both horizons clear the round trip that captures them",
+    subtitle="Exceedance of absolute perpetual returns against the declared maker and taker round trips",
+)
+plt.show()
 
 # %% [markdown]
-# ---
+# ### B.4 How long the premium describes the contract
 #
-# ## Section C: Design Decisions
+# Ranking contracts every eight hours is only worth the trading it causes if what the premium says
+# at one settlement still describes the same contract at the next. The statistic that answers this
+# is *autocorrelation*: the correlation between a series and the same series shifted back by a fixed
+# number of steps, called the lag. At lag 1 it asks whether a contract that is expensive to hold now
+# was also expensive to hold at the previous settlement; at lag 21 it asks whether it was expensive
+# a week ago.
 #
-# Design decisions are the strategy choices encoded in `setup.yaml` that the
-# feasibility evidence above supports. They are justified here, not in the
-# YAML.
-
-# %% [markdown]
-# ### C.1 Decision Cadence
-#
-# `setup.yaml::decision.cadence = 8_hour_funding_aligned` because the
-# Binance perpetuals funding schedule pays at 00:00, 08:00, and 16:00 UTC.
-# Trading at a sub-funding interval (1h or 4h) can incur more turnover before
-# a new eight-hour premium observation arrives. Daily trading holds a position
-# across three settlements but reacts to the premium signal only once per day.
-# The eight-hour cadence therefore aligns decisions with new information.
-#
-# `setup.yaml::decision.snapshot = pre_funding_timestamp` and
-# `decision.execution_delay = at_funding_timestamp` formalize the order-of-
-# operations declared by the design. The raw Binance bars are left-labeled by
-# bar-open time, while their close values become available at the next funding
-# boundary. The labels notebook must preserve that availability convention
-# when it assigns prediction timestamps.
-#
-# A full funding strategy would decompose return as
-# $R_{total} = R_{price} + R_{funding} - R_{fees}$. The current implementation
-# predicts $R_{price}$ from premium features and the backtest drops explicit
-# premium/funding columns from its price feed. Its reported return is therefore
-# price P&L net of trading costs, not total return including funding cash flows.
-
-# %% [markdown]
-# ### C.2 Kill Conditions
-#
-# Kill conditions are falsifiable checkpoints---if any triggers, the
-# strategy is abandoned or substantially reworked. The thresholds below are
-# anchored to the feasibility evidence in Sections B and D:
-#
-# - **KC1 (edge-cost)**: Model-driven gross return fails to survive costs in
-#   Chapter 16. Raw return magnitude in Section B.4 cannot clear this gate.
-# - **KC2 (premium persistence)**: The premium feature loses predictive value
-#   before the next eight-hour decision. Section D.1 measures persistence of
-#   the premium itself; predictive decay is evaluated later with IC.
-# - **KC3 (mechanism change)**: The exchange materially modifies the
-#   funding rate calculation (cap, interval, formula). Crypto perpetuals
-#   are exchange-defined products; a venue change can invalidate the
-#   historical training distribution.
-# - **KC4 (EW underperformance)**: Equal-weight long-short cross-section
-#   posts a higher Sharpe and lower drawdown than the strategy across all
-#   test folds. Gate: Chapter 17.
-
-# %% [markdown]
-# ### C.3 Mapping Class
-#
-# `setup.yaml::mapping.class = long_short_funding_aligned` with
-# `mapping.position_state_space = long_short`. Long-short is appropriate
-# because the premium can be positive or negative and perpetuals are
-# symmetrically tradable from either side. For funding cash flows, positive
-# funding is paid by longs to shorts, while negative funding is paid by shorts
-# to longs. The current price-return strategy uses both directions without
-# adding those cash flows to P&L.
-# Restricting to long-only would discard half the cross-sectional dispersion
-# in the funding-rate signal.
-#
-# `mapping.sizing` is declared as `equal_weight_or_risk_parity` because the
-# Chapter 17 portfolio sweep tests score-weighted,
-# inverse-volatility, risk-parity, mean-variance, and HRP allocators on the
-# same selection (see `setup.yaml::backtest.sweep.allocators`). Chapter 16
-# fixes equal weight as the baseline; alternative allocators sweep in Chapter 17.
-
-# %% [markdown]
-# ---
-#
-# ## Section D: Walk-Forward Structure (Section 6.5)
-#
-# We verify that the data supports the walk-forward design declared in
-# `setup.yaml::evaluation` (`n_splits`, `train_size`, `val_size`,
-# `holdout_start`).
-
-# %% [markdown]
-# ### D.1 Effective Sample Size
-#
-# Raw decision count is misleading because the cross-sectional mean premium
-# index is highly autocorrelated. We report selected lags and an
-# initial-positive-sequence estimate of integrated autocorrelation time. This
-# estimate describes one aggregate series; it is not a substitute for the
-# per-decision-time IC and time-series inference used downstream.
+# Two choices about how it is computed change the answer. It is computed *inside each contract* and
+# then averaged, because stacking every contract into one series and correlating that would mostly
+# measure the point where one contract's history ends and the next begins. And it is computed over
+# each contract's longest unbroken run of settlements, because the helper counts lags by row: across
+# a hole in the history, row 1 and row 2 are not eight hours apart. The shaded band shows how much
+# contracts differ from one another, and the horizontal strip is the range within which a
+# correlation is indistinguishable from zero at this sample size.
 
 # %%
-premium_col = "premium_index_close" if "premium_index_close" in prices.columns else None
-if premium_col is None:
-    raise ValueError("Expected premium_index_close column in crypto premium data")
+gap = pl.col("timestamp").diff().over("symbol").ne(pl.duration(hours=BAR_HOURS)).fill_null(True)
+unbroken = (
+    research.with_columns(gap.cum_sum().over("symbol").alias("run"))
+    .with_columns(pl.len().over("symbol", "run").alias("run_len"))
+    .filter(pl.col("run_len") == pl.col("run_len").max().over("symbol"))
+)
+# a series correlated with itself is 1 by construction, and that bar would flatten every other one
+acf = panel_acf(unbroken, entity_col="symbol", value_col=PREMIUM, max_lags=ACF_LAGS)
+drawn = acf.filter(pl.col("lag") > 0)
 
-xs_mean_premium = (
-    research_prices.group_by("timestamp")
-    .agg(pl.col(premium_col).mean().alias("xs_mean"))
-    .sort("timestamp")
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+ax.axhspan(
+    -acf["band"][0],
+    acf["band"][0],
+    color=COLORS["copper"],
+    alpha=0.35,
+    zorder=0,
+    label="range expected from no information",
+)
+ax.fill_between(
+    drawn["lag"],
+    drawn["acf_p10"],
+    drawn["acf_p90"],
+    color=COLORS["blue"],
+    alpha=0.15,
+    label="10th to 90th percentile across contracts",
+)
+ax.bar(drawn["lag"], drawn["acf"], color=COLORS["blue"], width=0.7)
+ax.set_xlabel("Settlements between the two readings")
+ax.set_ylabel("Correlation with the contract's own past")
+ax.legend(frameon=False, fontsize=8, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.18))
+add_message_title(
+    ax,
+    "Premium persistence outlasts every horizon the labels declare",
+    subtitle="Mean within-contract autocorrelation, shaded 10th-90th percentile across contracts",
+)
+plt.show()
+
+# %% [markdown]
+# A cross-sectional book also needs contracts to disagree at one timestamp, so quantiles are taken
+# there and thinned to a daily median only after: pooling first folds the level into the band.
+
+# %%
+BANDS = (("lo", 0.1), ("mid", 0.5), ("hi", 0.9))
+spread = (
+    research.group_by("timestamp")
+    .agg(pl.col(PREMIUM).quantile(q).mul(1e4).alias(name) for name, q in BANDS)
+    .group_by(pl.col("timestamp").dt.truncate("1d").alias("day"))
+    .agg(pl.col(name).median() for name, _ in BANDS)
+    .sort("day")
     .drop_nulls()
 )
-decisions_per_day = 3
-days_per_year = 365
-raw_decisions_per_year = decisions_per_day * days_per_year
-acf_max_lag = min(raw_decisions_per_year, len(xs_mean_premium) - 1)
-acf_vals = acf(xs_mean_premium["xs_mean"].to_numpy(), nlags=acf_max_lag, fft=True)
-acf_lags = [1, 3, 9, 27, 81, 243, 729]
-acf_rows = [
-    {"lag_bars": int(lag), "lag_hours": int(lag * 8), "acf": float(acf_vals[lag])}
-    for lag in acf_lags
-    if lag < len(acf_vals)
-]
-acf_df = pl.DataFrame(acf_rows)
-print("Premium-index ACF (cross-sectional mean, 8h bars):")
-acf_df
 
-# %% [markdown]
-# The slowly decaying ACF makes the dependence visible. The 243-day lag is
-# still positive, so treating 1,095 annual decision times as independent would
-# materially overstate precision.
-
-# %%
-acf_labels = ["8h", "1d", "3d", "9d", "27d", "81d", "243d"]
-fig, ax = plt.subplots(figsize=FIGSIZE["single_wide"])
-ax.bar(acf_labels, acf_df["acf"], color=COLORS["blue"])
-ax.axhline(0, color=COLORS["neutral"], linewidth=0.8)
-ax.set_ylim(0, 0.85)
-ax.set_xlabel("Lag")
-ax.set_ylabel("Autocorrelation")
-ax.set_title("The cross-sectional premium index remains persistent for months")
-fig.tight_layout()
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+ax.fill_between(
+    spread["day"],
+    spread["lo"],
+    spread["hi"],
+    color=COLORS["blue"],
+    alpha=0.25,
+    label="10th to 90th percentile of contracts",
+)
+ax.plot(spread["day"], spread["mid"], color=COLORS["blue"], lw=0.8, label="median contract")
+zero_line(ax)
+ax.legend(frameon=False, fontsize=8, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.12))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.set_ylabel("Premium index (bps of the tracked index)")
+add_message_title(
+    ax,
+    "The premium moves as a common level more than contracts disperse",
+    subtitle="Cross-sectional quantiles at each funding timestamp, shown at their daily median",
+)
 plt.show()
 
-# %%
-positive_pair_sums = []
-for lag in range(1, len(acf_vals) - 1, 2):
-    pair_sum = float(acf_vals[lag] + acf_vals[lag + 1])
-    if pair_sum <= 0:
-        break
-    positive_pair_sums.append(pair_sum)
-
-integrated_autocorrelation_time = 1.0 + 2.0 * sum(positive_pair_sums)
-effective_decisions_per_year = raw_decisions_per_year / integrated_autocorrelation_time
-acf_1bar = float(acf_vals[1])
-print(f"Raw decision points per year: {raw_decisions_per_year}")
-print(f"ACF at 1 lag (8h):            {acf_1bar:.3f}")
-print(f"Integrated autocorrelation:   {integrated_autocorrelation_time:.1f} bars")
-print(f"Aggregate-series ESS/year:    ~{effective_decisions_per_year:.1f}")
-
 # %% [markdown]
-# Premium persistence is the mechanism being tested, but it also invalidates
-# naive independent-observation counts. The one-bar purge in
-# `setup.yaml::labels.buffer = 8H` follows from the forward-label horizon, not
-# from this ACF calculation. Serial dependence is handled separately by
-# time-ordered folds and dependence-aware inference.
-
-# %% [markdown]
-# ### D.2 Walk-Forward Fold Demonstration
+# ### B.5 Move scale against cost
 #
-# `case_studies/utils/cv_window.py` owns the operational splits; this cell
-# reproduces the fold boundaries from canonical `setup.yaml` parameters to
-# verify the data supports the declared design. Each fold has:
-#
-# - **Train period**: `setup.yaml::evaluation.train_size`
-# - **Val period**: `setup.yaml::evaluation.val_size`
-# - **Purge gap**: 1 funding period (8h) between train end and test start
-#   (matches `labels.buffer = 8H`)
-# - **Calendar**: `crypto` (24/7, 365 trading days per year)
+# The ratio divides the median absolute move at the primary horizon by the taker round trip, the
+# tier a contract outside the majors pays. It says nothing about whether the move is forecastable.
 
 # %%
-n_splits_declared = int(SETUP["evaluation"]["n_splits"])
+primary = moves[f"h{HORIZONS[0]}"].drop_nulls()
+print(
+    f"Round trip {MAKER_RT} bps at maker and {TAKER_RT} bps at taker | median {HORIZONS[0]}-hour "
+    f"move {primary.median():.0f} bps, ratio {primary.median() / TAKER_RT:.0f}x, share above the "
+    f"taker round trip {(primary > TAKER_RT).mean():.3f}"
+)
+
+# %% [markdown] tags=["results"]
+# The maker round trip costs 4 bps and the taker round trip 8 bps. The median absolute 8-hour move
+# is 138 bps, 17 times the taker round trip, and 0.963 of moves are larger than it. The numerator is
+# an unsigned magnitude, so it bounds the room a forecast has and says nothing about whether one
+# exists.
+
+# %% [markdown]
+# ## C. Design decisions
+#
+# ### C.1 Cadence
+#
+# `setup.yaml::decision.cadence` rebalances on the funding grid and executes at the funding
+# timestamp. That is an information schedule rather than a hyperparameter to sweep: a new premium
+# observation exists only when a period settles, so a decision between settlements reads the same
+# premium twice and pays twice for it. B.4 supports holding through at least one period.
+#
+# ### C.2 Kill conditions
+#
+# Four falsifiable checkpoints send the strategy back to the drawing board, each tested where its
+# evidence exists: a gross return the fee erases, in Chapter 16; a premium that stops predicting by
+# the next funding timestamp, in Chapter 7 through the information coefficient; a venue change to
+# the funding formula, cap or interval, leaving the training distribution describing a product that
+# no longer exists; and an equal-weight cross-section with a higher Sharpe, in Chapter 17.
+#
+# ### C.3 Mapping class
+#
+# `setup.yaml::mapping.class` ranks contracts on the premium and holds both legs, which a perpetual
+# allows from either side and which cancels the level B.4 shows is most of what the premium does.
+# Sizing is equal weight or risk parity: Chapter 16 fixes the first, Chapter 17 sweeps the rest.
+
+# %% [markdown]
+# ## D. Walk-forward structure
+#
+# ### D.1 Effective sample size
+#
+# What evaluation spends is independent observations, not rows. Summing the initial positive
+# sequence of B.4's mean curve gives the integrated autocorrelation time, the funding periods one
+# independent premium observation is worth - for one contract's carrier, not for the decisions a
+# portfolio takes. The sequence never turns negative here, so the count below is a ceiling.
+
+# %%
+curve = acf["acf"].to_numpy()
+pairs = curve[1::2][: len(curve[2::2])] + curve[2::2]
+turns = np.flatnonzero(pairs <= 0)
+tau = 1 + 2 * pairs[: turns[0] if turns.size else len(pairs)].sum()
+raw_periods = SETUP["evaluation"]["periods_per_year"] * 24 // BAR_HOURS
+print(
+    f"Funding timestamps {len(breadth):,} | contracts per timestamp {breadth['n'].mean():.1f} | "
+    f"integrated autocorrelation {tau:.0f} funding periods, so at most {raw_periods / tau:.0f} "
+    f"independent premium observations per contract a year against {raw_periods:,} settlements"
+)
+
+# %% [markdown]
+# ### D.2 Fold demonstration
+#
+# A walk-forward split cuts the development period into consecutive blocks: a *training* window the
+# model is fitted on, then a *validation* window it is scored on, with the pair sliding forward to
+# make the next fold. Between the two sits a *purge gap*, a stretch that is dropped from both. It is
+# needed because a label is a statement about the future: a target computed at the last moment of
+# training resolves some hours later, and without the gap that resolution falls inside validation
+# and the score is partly a score on data the model was fitted on.
+#
+# `generate_cv_splits` places those boundaries from the widths in `setup.yaml::evaluation` and the
+# gap from the label buffer, and the figure draws the boundaries it returned rather than
+# recomputing them, so the picture and the folds cannot disagree.
+#
+# The splitter is given the whole sample, holdout included, and applies the holdout boundary itself
+# from `evaluation.holdout_start`, which is what every later stage does too. Trimming the data first
+# would shift the first training settlement of most folds, and the figure would then show a training
+# window the pipeline never trains on. The splitter numbers folds from zero backwards from the most
+# recent, so fold 0 is the one that ends against the holdout. The figure draws them earliest-first
+# and labels each with that number, which is why the labels count down; every later stage prints the
+# same ones.
+#
+# The gap drawn is the buffer for the primary label, `labels.buffer`. The longest declared variant,
+# `fwd_ret_24h`, resolves three settlements out and carries its own wider buffer in
+# `labels.variant_buffers`; the figure shows the primary one, and a fold built for that variant has
+# a proportionally wider gap.
+
+# %%
 splits = generate_cv_splits(
-    prices,
+    bars.select("timestamp"),
     case_study_id=CASE_STUDY_ID,
-    label_buffer="8H",
+    label_buffer=LABEL_BUFFER,
     date_col="timestamp",
 )
-
-assert len(splits) == n_splits_declared, (
-    f"Expected {n_splits_declared} folds (setup.yaml), got {len(splits)}"
+last_val = max(split["val_end"] for split in splits)
+assert len(splits) == SETUP["evaluation"]["n_splits"], "fold count differs from setup.yaml"
+holdout_opens = pd.Timestamp(HOLDOUT_START, tz="UTC")
+assert last_val + pd.Timedelta(LABEL_BUFFER) < holdout_opens, (
+    "a fold's last label reaches the holdout"
 )
-latest_split = max(splits, key=lambda split: split["val_end"])
-last_val_end = latest_split["val_end"]
-holdout_boundary = pl.Series([HOLDOUT_START]).str.to_datetime().dt.replace_time_zone("UTC").item()
-assert last_val_end + timedelta(hours=8) < holdout_boundary
-print(f"Generated {len(splits)} walk-forward folds")
-print(f"Last fold val end: {last_val_end}  |  Holdout start: {HOLDOUT_START}")
-
-# %% [markdown]
-# **Walk-forward fold summary:**
-
-# %%
-splits_df = pl.DataFrame(splits).with_columns(
-    pl.col("fold") + 1,
-    pl.lit(1).alias("purge_bars"),
-)
-splits_df
-
-# %% [markdown]
-# #### Universe Breadth per Fold
-#
-# Because the panel is unbalanced (newer perps enter after their listing
-# date), we verify that each fold's val window has adequate cross-sectional
-# breadth. With ~20 perps and a long-short top-k rule, a handful of inactive
-# symbols per fold is acceptable but worth checking.
-
-# %%
-fold_breadth = []
-for split in splits:
-    active = (
-        prices.filter(pl.col("timestamp").is_between(split["val_start"], split["val_end"]))
-        .group_by("symbol")
-        .agg(pl.col("timestamp").count().alias("n_bars"))
-        .filter(pl.col("n_bars") > 0)
-    )
-    fold_breadth.append(
-        {
-            "fold": split["fold"] + 1,
-            "val_start": str(split["val_start"]),
-            "n_active": int(active.height),
-        }
-    )
-
-fold_breadth_df = pl.DataFrame(fold_breadth)
-print("Active perpetuals per fold val period:")
-fold_breadth_df
-
-# %% [markdown]
-# ---
-#
-# ## Section E: Derived Artifacts
-#
-# This case study does not produce a point-in-time eligibility table; the
-# universe is fixed by `setup.yaml::universe.symbols` and panel
-# unbalancedness is handled downstream by the loader (rows simply do not
-# exist before a contract's listing date). The only derived artifact is the
-# feasibility report in Section F.
-
-# %% [markdown]
-# ---
-#
-# ## Section F: Findings vs `setup.yaml`
-#
-# The canonical strategy declarations live in `config/setup.yaml`. This
-# section enumerates each declared knob alongside the feasibility evidence
-# above that motivates it. `setup.yaml` is not regenerated here --- it is
-# the hand-curated source of truth, and this notebook reads it.
-
-# %%
-median_1h_abs_pct = float(np.median(abs_1h) * 100)
-median_4h_abs_pct = float(np.median(abs_4h) * 100)
-median_8h_abs_pct = float(np.median(abs_8h) * 100)
-median_daily_abs_pct = float(np.median(abs_daily) * 100)
-frac_1h_above_alts = float((abs_1h > ALTS_RT).mean())
-frac_4h_above_alts = float((abs_4h > ALTS_RT).mean())
-frac_8h_above_alts = float((abs_8h > ALTS_RT).mean())
-frac_daily_above_alts = float((abs_daily > ALTS_RT).mean())
-frac_8h_above_majors = float((abs_8h > MAJORS_RT).mean())
-n_active_min = int(min(fb["n_active"] for fb in fold_breadth))
-n_active_max = int(max(fb["n_active"] for fb in fold_breadth))
-n_folds_generated = int(len(splits))
-
-print("=" * 78)
-print("Setup.yaml knobs vs feasibility evidence")
-print("=" * 78)
-
-print()
-print(f"universe.n_assets = {SETUP['universe']['n_assets']}")
-print(f"  -> loaded panel: {n_symbols} contracts (unbalanced; listing-date entry)")
-print(f"  -> per-fold val active: min={n_active_min}, max={n_active_max}")
-
-# %%
-print()
-print(f"decision.cadence = {SETUP['decision']['cadence']}")
-print(
-    f"  -> median |8h return| = {median_8h_abs_pct:.3f}%; "
-    f"{frac_8h_above_alts * 100:.0f}% exceed alts RT ({ALTS_RT * 1e4:.0f} bps)"
-)
-print(
-    f"  -> share above alts RT rises from {frac_1h_above_alts * 100:.0f}% (1h) and "
-    f"{frac_4h_above_alts * 100:.0f}% (4h) to {frac_8h_above_alts * 100:.0f}% (8h)"
-)
-
-print()
-print(f"costs.class = {SETUP['costs']['class']}")
-print(
-    f"  -> at {MAJORS_RT * 1e4:.0f}bps RT (majors, maker): "
-    f"{frac_8h_above_majors * 100:.0f}% of 8h moves exceed cost"
-)
-print(
-    f"  -> at {ALTS_RT * 1e4:.0f}bps RT (alts, taker):   "
-    f"{frac_8h_above_alts * 100:.0f}% of 8h moves exceed cost"
-)
-print(f"  -> market-move-to-cost ratio (8h, alts tier) = {move_to_cost_ratio_8h:.1f}x")
-
-print()
-print(f"labels.primary = {SETUP['labels']['primary']}")
-print(
-    f"  -> median |8h return| = {median_8h_abs_pct:.3f}% = "
-    f"{(median_8h_abs_pct / 100) / ALTS_RT:.0f}x the alts RT cost"
-)
-
-print()
-print(f"labels.variants = {SETUP['labels']['variants']}")
-print(
-    f"  -> daily median |return| = {median_daily_abs_pct:.3f}% "
-    f"({frac_daily_above_alts * 100:.0f}% > alts RT)"
-)
-
-# %%
-print()
-print(f"evaluation.n_splits = {SETUP['evaluation']['n_splits']}")
-print(f"  -> generated {n_folds_generated} folds; declared count matches")
-print(
-    f"  -> holdout {SETUP['evaluation']['holdout_start']} "
-    f"to {SETUP['evaluation']['holdout_end']}; "
-    f"last val ends {last_val_end}"
-)
-print(
-    f"  -> premium-index ACF(1)={acf_1bar:.2f} => "
-    f"aggregate-series ESS/year ~{effective_decisions_per_year:.1f} "
-    f"(raw {raw_decisions_per_year})"
-)
-
-# %% [markdown]
-# ### Persist Feasibility Findings
-
-# %%
-return_distribution = {
-    "1h_median": median_1h_abs_pct,
-    "4h_median": median_4h_abs_pct,
-    "8h_median": median_8h_abs_pct,
-    "daily_median": median_daily_abs_pct,
+BUFFER_SLOTS = int(pd.Timedelta(LABEL_BUFFER) / pd.Timedelta(hours=BAR_HOURS))
+purged = {
+    int((s["val_start"] - s["train_end"]) / pd.Timedelta(hours=BAR_HOURS)) - 1 for s in splits
 }
-cost_exceedance = {
-    "1h": frac_1h_above_alts * 100,
-    "4h": frac_4h_above_alts * 100,
-    "8h": frac_8h_above_alts * 100,
-    "daily": frac_daily_above_alts * 100,
+assert purged == {BUFFER_SLOTS}, (
+    f"{sorted(purged)} settlements purged, not the {BUFFER_SLOTS} the {LABEL_BUFFER} buffer needs"
+)
+widths = {
+    ((s["train_end"] - s["train_start"]).days, (s["val_end"] - s["val_start"]).days) for s in splits
 }
-premium_acf = {f"lag_{row['lag_bars']}bar_{row['lag_hours']}h": row["acf"] for row in acf_rows}
-effective_sample_size = {
-    "raw_decisions_per_year": raw_decisions_per_year,
-    "acf_1bar": acf_1bar,
-    "integrated_autocorrelation_time_bars": integrated_autocorrelation_time,
-    "effective_decisions_per_year": effective_decisions_per_year,
-    "method": "initial_positive_sequence_on_cross_sectional_mean_premium",
-}
-walk_forward = {
-    "n_folds_generated": n_folds_generated,
-    "n_splits_declared": int(SETUP["evaluation"]["n_splits"]),
-    "holdout_start": HOLDOUT_START,
-    "holdout_end": HOLDOUT_END,
-    "last_val_end": str(last_val_end),
-}
+assert len(widths) == 1, f"folds differ in width: {sorted(widths)}"
+train_days, val_days = widths.pop()
+print(
+    f"{len(splits)} folds | training {train_days} days and validating {val_days} days each | "
+    f"{purged.pop()} settlement purged between them, matching the {LABEL_BUFFER} label buffer"
+)
 
-# %%
-feasibility_report = {
-    "case_study_id": "crypto_perps_funding",
-    "data_period": {
-        "research_start": START_DATE,
-        "research_end": RESEARCH_END,
-        "sealed_holdout_start": HOLDOUT_START,
-        "coverage_observation_end": END_DATE,
-    },
-    "universe": {
-        "n_assets_declared": int(SETUP["universe"]["n_assets"]),
-        "n_assets_loaded": int(n_symbols),
-        "n_active_per_fold_min": n_active_min,
-        "n_active_per_fold_max": n_active_max,
-    },
-    "cost_tiers_bps": {
-        "majors_round_trip": MAJORS_RT * 1e4,
-        "alts_round_trip": ALTS_RT * 1e4,
-    },
-    "return_distribution_abs_pct": return_distribution,
-    "cost_exceedance_alts_rt_pct": cost_exceedance,
-    "cost_exceedance_majors_rt_8h_pct": frac_8h_above_majors * 100,
-    "market_move_to_cost_ratio_8h_alts": float(move_to_cost_ratio_8h),
-    "premium_index_acf": premium_acf,
-    "effective_sample_size": effective_sample_size,
-    "walk_forward": walk_forward,
-}
-
-report_path = EXPLORATION_DIR / "feasibility_report.json"
-with open(report_path, "w") as f:
-    json.dump(feasibility_report, f, indent=2)
-    f.write("\n")
-print(f"Written: {display_path(report_path)}")
+fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+fold_timeline(ax, splits, holdout=(HOLDOUT_START, HOLDOUT_END))
+add_message_title(
+    ax,
+    "Folds roll forward and stop short of the holdout",
+    subtitle="Boundaries as generate_cv_splits returned them; the one-settlement purge is too narrow to see",
+)
+plt.show()
 
 # %% [markdown]
-# ---
+# ## E. Derived artifacts
 #
-# ## Key Takeaways
+# This notebook writes nothing. `setup.yaml::universe.symbols` fixes the contract list and the
+# loader carries no row before a contract was listed, so there is no eligibility table for a later
+# notebook to filter on - the panel itself already contains only what could have been traded.
+
+# %% [markdown]
+# ## F. Findings vs `setup.yaml`
 #
-# 1. **Universe**: 19 crypto perpetuals form an unbalanced panel with
-#    listing-date entry and no backfill. This prevents pre-listing rows, but
-#    the fixed survivor list is not a point-in-time liquidity universe.
-# 2. **Price-move scale**: In the pre-holdout research period, most absolute
-#    8h returns exceed the alts round-trip fee. This shows sufficient variation
-#    for modeling, not tradable edge. The Chapter 16 backtest must clear costs.
-# 3. **Cadence**: `setup.yaml::decision.cadence = 8_hour_funding_aligned`
-#    follows the premium-information schedule. Daily positions remain open
-#    across three settlements but refresh their signal only once.
-# 4. **Return definition**: The current labels and backtest measure price P&L
-#    net of trading costs. They do not add explicit funding cash flows, even
-#    though premium and estimated funding rates are model features.
-# 5. **Dependence**: Premium-index ACF remains positive for months. An
-#    initial-positive-sequence calculation gives only about 3 effective annual
-#    observations for the aggregate premium series, so raw decision counts
-#    cannot justify precision. The one-bar purge follows the label horizon.
-# 6. **Mapping**: Long-short equal-weight top-k as the Chapter 16 baseline;
-#    score-weighted, inverse-vol, risk-parity, mean-variance, and HRP
-#    allocators sweep in Chapter 17 (`setup.yaml::backtest.sweep.allocators`).
-# 7. **Evaluation**: 2 walk-forward folds (2022, 2023) with 2Y rolling train,
-#    holdout 2024-2025 sealed.
+# Each declared setting is paired below with the evidence in this notebook that motivates it, and
+# with the condition under which a reader working on their own data would revise it.
 #
-# **Known limitations**:
-# - Fixed survivor list: late-listed contracts enter only after listing, but
-#   the 19-symbol list is not a historical point-in-time liquidity universe.
-# - Unbalanced panel: APT, INJ, and SUI enter after their listing dates;
-#   earlier folds have narrower cross-sections.
-# - Funding cash flows are excluded from the current backtest return.
-# - Exchange-specific (Binance) funding conventions may not generalize to
-#   other venues.
-# - Liquidation risk and leverage are out of scope for this baseline setup.
+# | Knob | Evidence | Revise it when |
+# |---|---|---|
+# | `universe.symbols`, `backtest.sweep.top_k_grid` | B.2 breadth against the contracts a top-10 book needs on both sides | breadth falls below what the book needs, as it does here at every settlement for the top-10 entry |
+# | `decision.cadence` | B.3 exceedance, B.4 persistence | moves stop clearing the round trip, or the premium decays inside one funding period |
+# | `costs.fee_schedule` | B.3 the two declared round trips | the venue changes a tier, or a contract moves between them |
+# | `evaluation.n_splits` | D.1 independent observations, D.2 boundaries | the folds no longer fit the development window |
+
+# %%
+print(
+    f"universe.n_assets {SETUP['universe']['n_assets']}, breadth {breadth['n'].min()} to "
+    f"{breadth['n'].max()}, under the floor of {BREADTH_FLOOR} on "
+    f"{breadth.filter(pl.col('n') < BREADTH_FLOOR).height:,} of {len(breadth):,} timestamps\n"
+    f"decision.cadence {SETUP['decision']['cadence']} | labels.primary {PRIMARY_LABEL}\n"
+    f"evaluation.n_splits {SETUP['evaluation']['n_splits']}, generated {len(splits)}, last "
+    f"validation ends {last_val.date()}, holdout untouched"
+)
+
+# %% [markdown] tags=["results"]
+# The declared universe holds 19 contracts. Breadth at a funding timestamp runs from 2 to 19 and
+# stays under the 20 that the largest declared book needs on all 4,382 of them, so the
+# top-10 grid entry cannot fill both legs anywhere in the development window. Two folds are
+# generated, the last validation ending 2023-12-31. An integrated autocorrelation of 37 funding
+# periods leaves at most 30 independent premium observations per contract a year, of 1,095.
+
+# %% [markdown]
+# ## Key takeaways
 #
-# **Artifacts written**:
-# - `config/exploration/feasibility_report.json`: summary numbers downstream
-#   notebooks and the chapter README can cite without re-running this
-#   notebook.
+# 1. **Count the panel at the moments the strategy is allowed to trade.** Contracts entering at
+#    their listing dates give breadth a history, and the book the strategy wants has to fit inside
+#    that history at every one of those moments, not on average.
+# 2. **Compute a panel autocorrelation inside each entity, over unbroken stretches.** Stacking
+#    contracts measures where two of them meet; counting lags by row measures across the gaps.
+# 3. **Turn persistence into an observation count before trusting a sample size**, and read it as a
+#    ceiling where the initial positive sequence runs past the lags you drew.
+# 4. **Separate the common level from the cross-sectional spread.** A ranking reads what is left
+#    once the level both legs cancel comes out, and here the level is the larger part.
 #
-# **Next**: [`02_labels`](02_labels.ipynb) creates `fwd_ret_8h` and the
-# variant labels declared in `setup.yaml::labels`.
+# ### Known limitations
+#
+# - The contract list is fixed and was drawn knowing which perpetuals stayed listed, so it carries
+#   selection and delisting bias, and the earliest folds see a much narrower cross-section.
+# - Cost is the published fee alone; slippage and the entry spread need a notional and enter at the
+#   cost stage. Funding itself is not part of the cost: the strategy holds the price move rather
+#   than collecting the transfer, so the labels and the registered backtest measure the move net of
+#   fees only, and the premium enters as a feature. Chapter 13 replays the selected configuration a
+#   second time with the official settlements added, outside the registry, to show separately what
+#   the transfer would have been worth.
+#
+# **Next**: labels at the declared horizons, built on this development window.
