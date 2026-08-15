@@ -47,8 +47,10 @@ Usage::
 # --- completeness ---
 from .completeness import (
     BacktestRunStatus,
+    PredictionCoverage,
     TrainingRunStatus,
     backtest_run_status,
+    evaluate_prediction_coverage,
     skip_backtest_if_complete,
     skip_training_if_complete,
     training_run_status,
@@ -117,12 +119,17 @@ from .registration import (
 from .specs import (
     DEFAULT_SEED,
     HASH_LENGTH,
+    IDENTITY_VERSION,
+    LEGACY_IDENTITY_VERSION,
+    SUPPORTED_IDENTITY_VERSIONS,
     backtest_hash_from_parts,
     build_training_spec,
     canonical_json,
+    canonical_value,
     compute_hash,
     load_preset,
     prediction_hash_from_parts,
+    project_training_identity,
     training_hash_from_spec,
 )
 
@@ -137,10 +144,15 @@ __all__ = [
     # specs
     "DEFAULT_SEED",
     "HASH_LENGTH",
+    "IDENTITY_VERSION",
+    "LEGACY_IDENTITY_VERSION",
+    "SUPPORTED_IDENTITY_VERSIONS",
     "canonical_json",
+    "canonical_value",
     "compute_hash",
     "training_hash_from_spec",
     "prediction_hash_from_parts",
+    "project_training_identity",
     "backtest_hash_from_parts",
     "load_preset",
     "build_training_spec",
@@ -164,6 +176,8 @@ __all__ = [
     # completeness
     "TrainingRunStatus",
     "BacktestRunStatus",
+    "PredictionCoverage",
+    "evaluate_prediction_coverage",
     "training_run_status",
     "backtest_run_status",
     "skip_training_if_complete",

@@ -273,6 +273,7 @@ modeling:
     libraries: [lightgbm]
     preset: default
     device: gpu
+    max_bin: 63
   latent_factors:
     persistent_entities: true
     macro_context:
@@ -295,8 +296,10 @@ modeling:
       alignment: backward_asof
     model_kwargs:
       ipca:
-        max_iter: 10000
+        max_iter: 100
         tol: 0.00001
+        factor_ridge: 0.01
+        gamma_ridge: 0.01
       sdf:
         checkpoint_epochs: [256, 512, 768, 1024, 1280]
         beta_checkpoint_epochs: [256]
@@ -343,7 +346,7 @@ features:
     positive_share: 63   # share of up sessions
     extremes: 252        # distance from the 52-week high and low
     correlation: 63      # SPY-TLT rolling correlation
-    curve_zscore: 252    # yield-curve slope z-score, over Treasury publication days
+    curve_zscore: 252    # yield-curve slope z-score, over trading sessions
   families:
     - name: momentum
       pattern: ret_*d|skip_recent_*|mom_accel_*

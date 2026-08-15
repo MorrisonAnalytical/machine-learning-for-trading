@@ -172,12 +172,17 @@ modeling:
     libraries: [lightgbm]
     preset: default
     device: cpu
+    max_bin: 63
   latent_factors:
     persistent_entities: true
     # Down-tune the SDF schedule on this large-N CS so training time stays
     # in the overnight budget. Paper defaults (256/64/1024) on broad US
     # equities at daily frequency would take many hours per fold.
     model_kwargs:
+      ipca:
+        max_iter: 10000
+        factor_ridge: 0.01
+        gamma_ridge: 0.01
       sdf:
         n_epochs_unc: 128
         n_epochs_moment: 32

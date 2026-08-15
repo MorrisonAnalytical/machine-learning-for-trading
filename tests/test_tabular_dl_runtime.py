@@ -78,7 +78,7 @@ def test_classification_cv_keeps_continuous_evaluation_target(
     def capture_fold(**kwargs):
         captured["fit"] = kwargs["y_val"].copy()
         captured["eval"] = kwargs["y_eval_val"].copy()
-        predictions = np.zeros(len(kwargs["y_val"]), dtype=np.float32)
+        predictions = np.arange(len(kwargs["y_val"]), dtype=np.float32)
         return {1: 0.25}, {1: predictions}, {1: 0.5}
 
     monkeypatch.setattr(tabular_dl, "_train_tabm_fold", capture_fold)
@@ -111,6 +111,7 @@ def test_classification_cv_keeps_continuous_evaluation_target(
         eval_label_col="return",
         task_type="classification",
         class_values=[0, 1],
+        class_weights_by_fold={0: (1.0, 1.0)},
         date_col="timestamp",
         entity_col="symbol",
         device="cpu",
@@ -433,6 +434,124 @@ def test_cached_replay_rejects_corrupted_daily_registry_metrics(
         )
 
 
+def test_cached_replay_selects_full_decision_time_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    dates = (
+        [pd.Timestamp("2020-04-01")] * 5
+        + [pd.Timestamp("2020-05-01")] * 5
+        + [pd.Timestamp("2020-06-01")] * 5
+    )
+    symbols = list(range(5)) * 3
+    actual = list(range(5)) * 3
+    full = pl.DataFrame(
+        {
+            "timestamp": dates,
+            "symbol": symbols,
+            "y_true": actual,
+            "y_score": list(reversed(range(5))) + list(range(5)) * 2,
+            "fold_id": [0] * 5 + [1] * 5 + [2] * 5,
+        }
+    ).with_columns(pl.col("y_score").cast(pl.Float64))
+    partial = full.with_columns(
+        pl.when(pl.col("timestamp") == pd.Timestamp("2020-06-01"))
+        .then(0.0)
+        .otherwise(pl.col("y_true"))
+        .alias("y_score")
+    )
+    frames = {10: full, 20: partial}
+    _install_cache(monkeypatch, tmp_path, frames)
+
+    metrics = {}
+    for epoch, frame in frames.items():
+        stats = tabular_dl.cross_sectional_ic(
+            frame,
+            frame,
+            pred_col="y_score",
+            ret_col="y_true",
+            date_col="timestamp",
+            entity_col="symbol",
+            method="spearman",
+            min_obs=5,
+        )
+        metrics[f"prediction-{epoch}"] = pl.DataFrame(
+            {
+                "ic_mean_daily": [stats["ic_mean"]],
+                "ic_std_daily": [stats["ic_std"]],
+            }
+        )
+    monkeypatch.setattr(
+        registry,
+        "load_prediction_metrics",
+        lambda _case_study, *, prediction_hash: metrics[prediction_hash],
+    )
+
+    result, _, curves = tabular_dl._load_cached_tabm_config(
+        case_study="probe",
+        training_spec={"family": "tabular_dl", "label": "label", "seed": 42},
+        config_name="tabm_probe",
+        prediction_split="validation",
+        date_col="timestamp",
+        entity_col="symbol",
+        eval_col=None,
+        expected_checkpoints=(10, 20),
+        expected_keys=full.select("timestamp", "symbol", "fold_id"),
+    )
+
+    assert {row["epoch"]: row["ic_n_days"] for row in curves} == {10: 3, 20: 2}
+    assert result["best_epoch"] == 10
+
+
+def test_training_without_save_dir_keeps_checkpoint_eligibility_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = _classification_frame()
+    splits = [
+        {
+            "fold": 0,
+            "train_start": pd.Timestamp("2020-01-01"),
+            "train_end": pd.Timestamp("2020-03-01"),
+            "val_start": pd.Timestamp("2020-04-01"),
+            "val_end": pd.Timestamp("2020-05-01"),
+        }
+    ]
+
+    def fake_fold(**kwargs):
+        actual = kwargs["y_eval_val"].astype(np.float32)
+        return {1: 0.1, 2: 0.9}, {1: actual, 2: np.full_like(actual, np.inf)}, {}
+
+    monkeypatch.setattr(tabular_dl, "TabMModel", lambda **_kwargs: object())
+    monkeypatch.setattr(tabular_dl, "_train_tabm_fold", fake_fold)
+
+    result = tabular_dl.run_tabm_cv(
+        frame,
+        splits,
+        configs=[
+            {
+                "family": "tabular_dl",
+                "config_name": "tabm_probe",
+                "params": {},
+                "n_epochs": 2,
+                "checkpoint_interval": 1,
+            }
+        ],
+        n_features=1,
+        feature_names=["feature"],
+        label_col="label",
+        date_col="timestamp",
+        entity_col="symbol",
+        device="cpu",
+        save_dir=None,
+    )
+
+    curves = {row["epoch"]: row for row in result["all_learning_curves"].to_dicts()}
+    assert result["best_epoch"] == 1
+    assert curves[1]["n_invalid"] == 0
+    assert curves[2]["n_invalid"] == 100
+    assert result["all_predictions"].height == 200
+
+
 def test_complete_registry_replays_predictions_instead_of_returning_empty(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -447,13 +566,13 @@ def test_complete_registry_replays_predictions_instead_of_returning_empty(
 
     cached_predictions = pl.DataFrame(
         {
-            "timestamp": [pd.Timestamp("2020-04-01")] * 5,
-            "symbol": list(range(5)),
-            "y_true": np.arange(5, dtype=float),
-            "y_score": np.arange(5, dtype=float),
-            "fold_id": [0] * 5,
-            "config": ["tabm_probe"] * 5,
-            "epoch": [25] * 5,
+            "timestamp": [pd.Timestamp("2020-04-01")] * 50,
+            "symbol": list(range(50)),
+            "y_true": np.arange(50, dtype=float),
+            "y_score": np.arange(50, dtype=float),
+            "fold_id": [0] * 50,
+            "config": ["tabm_probe"] * 50,
+            "epoch": [25] * 50,
         }
     )
     cached_result = {
@@ -486,7 +605,15 @@ def test_complete_registry_replays_predictions_instead_of_returning_empty(
 
     result = tabular_dl.run_tabm_cv(
         _classification_frame(),
-        [],
+        [
+            {
+                "fold": 0,
+                "train_start": "2020-01-01",
+                "train_end": "2020-03-01",
+                "val_start": "2020-04-01",
+                "val_end": "2020-04-01",
+            }
+        ],
         configs=[
             {
                 "family": "tabular_dl",
@@ -508,8 +635,104 @@ def test_complete_registry_replays_predictions_instead_of_returning_empty(
     )
 
     assert result["best_config_name"] == "tabm_probe"
-    assert result["predictions"].height == 5
+    assert result["predictions"].height == 50
+
+    with pytest.raises(ValueError, match="at least one fold"):
+        tabular_dl.run_tabm_cv(
+            _classification_frame(),
+            [],
+            configs=[
+                {
+                    "family": "tabular_dl",
+                    "config_name": "tabm_probe",
+                    "params": {"hidden_dim": 4, "n_members": 2, "dropout": 0.0},
+                    "n_epochs": 25,
+                    "checkpoint_interval": 25,
+                }
+            ],
+            n_features=1,
+            feature_names=["feature"],
+            label_col="return",
+            date_col="timestamp",
+            entity_col="symbol",
+            device="cpu",
+            save_dir=tmp_path,
+            register=True,
+            case_study="probe",
+        )
     assert result["grid_results"][0]["cached"] is True
+
+
+def test_direct_registered_batch_preserves_completed_sibling_on_later_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class MissingStatus:
+        complete = False
+        partial = False
+
+    registered: list[str] = []
+
+    def train_candidate(*, model, X_val, **_kwargs):
+        hidden_dim = int(model.backbone[0].out_features)
+        if hidden_dim == 8:
+            raise RuntimeError("injected later candidate failure")
+        predictions = np.asarray(X_val[:, 0], dtype=np.float64) + hidden_dim / 100
+        return {1: 0.1}, {1: predictions}, {1: 0.01}
+
+    monkeypatch.setattr(tabular_dl, "_train_tabm_fold", train_candidate)
+    monkeypatch.setattr(registry, "training_run_status", lambda *_args: MissingStatus())
+    monkeypatch.setattr(registry, "load_prediction_sets", lambda *_args, **_kwargs: pl.DataFrame())
+    monkeypatch.setattr(registry, "training_hash_from_spec", lambda _spec: "training")
+    monkeypatch.setattr(
+        tabular_dl,
+        "_register_tabm_config",
+        lambda **kwargs: registered.append(kwargs["config_name"]) or "training",
+    )
+
+    with pytest.raises(RuntimeError, match="injected later candidate failure"):
+        tabular_dl.run_tabm_cv(
+            _classification_frame(),
+            [
+                {
+                    "fold": 0,
+                    "train_start": pd.Timestamp("2020-01-01"),
+                    "train_end": pd.Timestamp("2020-03-01"),
+                    "val_start": pd.Timestamp("2020-04-01"),
+                    "val_end": pd.Timestamp("2020-05-01"),
+                }
+            ],
+            configs=[
+                {
+                    "family": "tabular_dl",
+                    "config_name": "tabm_s",
+                    "params": {"hidden_dim": 4, "n_members": 2, "dropout": 0.0},
+                    "n_epochs": 1,
+                    "batch_size": 32,
+                    "checkpoint_interval": 1,
+                },
+                {
+                    "family": "tabular_dl",
+                    "config_name": "tabm_m",
+                    "params": {"hidden_dim": 8, "n_members": 2, "dropout": 0.0},
+                    "n_epochs": 1,
+                    "batch_size": 32,
+                    "checkpoint_interval": 1,
+                },
+            ],
+            n_features=1,
+            feature_names=["feature"],
+            label_col="return",
+            date_col="timestamp",
+            entity_col="symbol",
+            device="cpu",
+            save_dir=tmp_path,
+            register=True,
+            case_study="probe",
+        )
+
+    assert registered == ["tabm_s"]
+    assert (tmp_path / "return" / "_incremental" / "tabm_s_fold0.parquet").exists()
 
 
 def test_saved_artifact_message_does_not_leak_absolute_path(
@@ -555,3 +778,58 @@ def test_saved_artifact_message_does_not_leak_absolute_path(
     output = capsys.readouterr().out
     assert str(tmp_path) not in output
     assert "Saved TabM artifacts for fwd_ret_1m" in output
+
+
+def test_tabm_selection_rejects_higher_ic_with_partial_decision_time_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = [pd.Timestamp("2020-01-31"), pd.Timestamp("2020-02-28")]
+    full = pl.DataFrame(
+        {
+            "timestamp": np.repeat(dates, 5),
+            "symbol": list(range(5)) * 2,
+            "y_true": list(range(5)) * 2,
+            "y_score": list(range(5)) * 2,
+            "fold_id": [0] * 5 + [1] * 5,
+            "config": ["full"] * 10,
+            "epoch": [25] * 10,
+        }
+    )
+    partial = full.head(5).with_columns(pl.lit("partial").alias("config"))
+    monkeypatch.setattr(
+        tabular_dl,
+        "compute_fold_metrics_from_predictions",
+        lambda *_args, **_kwargs: pl.DataFrame(),
+    )
+
+    result = tabular_dl._assemble_tabm_results(
+        config_results=[
+            {
+                "config_name": "partial",
+                "best_epoch": 25,
+                "best_ic": 0.9,
+                "ic_n_days": 1,
+                "n_invalid": 0,
+                "elapsed_s": 0.0,
+            },
+            {
+                "config_name": "full",
+                "best_epoch": 25,
+                "best_ic": 0.2,
+                "ic_n_days": 2,
+                "n_invalid": 0,
+                "elapsed_s": 0.0,
+            },
+        ],
+        all_predictions=pl.concat([partial, full]),
+        curve_rows=[],
+        training_rows=[],
+        save_dir=None,
+        date_col="timestamp",
+        entity_col="symbol",
+        eval_col=None,
+    )
+
+    assert result["best_config_name"] == "full"
+    assert result["grid_results"][0]["selectable"] is True
+    assert result["grid_results"][1]["selectable"] is False

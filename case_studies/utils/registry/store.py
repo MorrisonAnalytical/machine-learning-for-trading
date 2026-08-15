@@ -6,6 +6,7 @@ import json
 import logging
 import sqlite3
 import subprocess
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,7 +35,9 @@ CREATE TABLE IF NOT EXISTS training_runs (
     entry_point       TEXT,
     started_at        TEXT,
     elapsed_s         REAL,
-    runtime_json      TEXT
+    runtime_json      TEXT,
+    identity_version  INTEGER,
+    execution_tier    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_training_family_label ON training_runs(family, label);
@@ -51,6 +54,24 @@ CREATE TABLE IF NOT EXISTS prediction_sets (
 
 CREATE INDEX IF NOT EXISTS idx_pred_training ON prediction_sets(training_hash);
 CREATE INDEX IF NOT EXISTS idx_pred_split ON prediction_sets(split);
+
+CREATE TABLE IF NOT EXISTS prediction_coverage (
+    prediction_hash     TEXT PRIMARY KEY REFERENCES prediction_sets(prediction_hash),
+    expected_key_digest TEXT NOT NULL,
+    actual_key_digest   TEXT NOT NULL,
+    n_expected          INTEGER NOT NULL,
+    n_actual            INTEGER NOT NULL,
+    n_duplicates        INTEGER NOT NULL,
+    n_missing           INTEGER NOT NULL,
+    n_extra             INTEGER NOT NULL,
+    n_null              INTEGER NOT NULL,
+    n_non_finite        INTEGER NOT NULL,
+    n_folds_expected    INTEGER NOT NULL,
+    n_folds_actual      INTEGER NOT NULL,
+    schema_json          TEXT NOT NULL,
+    artifact_digest      TEXT NOT NULL,
+    status              TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS prediction_metrics (
     prediction_hash  TEXT PRIMARY KEY REFERENCES prediction_sets(prediction_hash),
@@ -83,7 +104,8 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     created_at       TEXT NOT NULL,
     git_commit       TEXT,
     started_at       TEXT,
-    elapsed_s        REAL
+    elapsed_s        REAL,
+    artifact_digests_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_backtest_pred ON backtest_runs(prediction_hash);
@@ -201,6 +223,113 @@ CREATE TABLE IF NOT EXISTS cohort_metrics (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cohort_unique
     ON cohort_metrics(cohort_type, COALESCE(stage, ''), label, COALESCE(family, ''));
 CREATE INDEX IF NOT EXISTS idx_cohort_leader ON cohort_metrics(leader_hash);
+
+CREATE TABLE IF NOT EXISTS candidate_sets (
+    set_hash                 TEXT PRIMARY KEY,
+    name                     TEXT NOT NULL,
+    member_kind              TEXT NOT NULL,
+    comparison_contract_json TEXT NOT NULL,
+    created_at               TEXT NOT NULL,
+    git_commit               TEXT
+);
+
+CREATE TABLE IF NOT EXISTS candidate_set_members (
+    set_hash    TEXT NOT NULL REFERENCES candidate_sets(set_hash),
+    member_hash TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL,
+    PRIMARY KEY (set_hash, ordinal),
+    UNIQUE (set_hash, member_hash)
+);
+
+CREATE TABLE IF NOT EXISTS research_locks (
+    lock_hash  TEXT PRIMARY KEY,
+    lock_json  TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_research_singleton ON research_locks((1));
+
+CREATE TABLE IF NOT EXISTS holdout_evaluations (
+    lock_hash               TEXT PRIMARY KEY REFERENCES research_locks(lock_hash),
+    holdout_training_hash   TEXT NOT NULL,
+    holdout_prediction_hash TEXT NOT NULL,
+    holdout_backtest_hash   TEXT NOT NULL,
+    fitted_state_digest     TEXT,
+    evaluated_at            TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execution_attempts (
+    attempt_id          TEXT PRIMARY KEY,
+    scientific_identity TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    diagnostics_json    TEXT NOT NULL,
+    started_at          TEXT NOT NULL,
+    completed_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_attempt_identity
+    ON execution_attempts(scientific_identity, started_at);
+
+CREATE TABLE IF NOT EXISTS candidate_fold_completions (
+    training_hash           TEXT NOT NULL REFERENCES training_runs(training_hash),
+    candidate_identity      TEXT NOT NULL,
+    fold_id                 INTEGER NOT NULL,
+    fitted_state_path       TEXT NOT NULL,
+    fitted_state_digest     TEXT NOT NULL,
+    prediction_shard_path   TEXT NOT NULL,
+    prediction_shard_digest TEXT NOT NULL,
+    resolved_settings_json  TEXT NOT NULL,
+    completed_at            TEXT NOT NULL,
+    PRIMARY KEY (training_hash, candidate_identity, fold_id)
+);
+
+CREATE TABLE IF NOT EXISTS official_populations (
+    population_hash  TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    member_kind      TEXT NOT NULL,
+    snapshot_json    TEXT NOT NULL,
+    supersedes_hash  TEXT REFERENCES official_populations(population_hash),
+    created_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_population_name
+    ON official_populations(name, created_at);
+
+CREATE TABLE IF NOT EXISTS official_population_members (
+    population_hash TEXT NOT NULL REFERENCES official_populations(population_hash),
+    member_hash     TEXT NOT NULL,
+    ordinal         INTEGER NOT NULL,
+    PRIMARY KEY (population_hash, ordinal),
+    UNIQUE (population_hash, member_hash)
+);
+
+CREATE TABLE IF NOT EXISTS overlay_references (
+    result_hash TEXT NOT NULL,
+    result_kind TEXT NOT NULL,
+    source_root TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (result_hash, result_kind)
+);
+
+CREATE TABLE IF NOT EXISTS decision_artifacts (
+    decision_hash       TEXT PRIMARY KEY,
+    decision_kind       TEXT NOT NULL,
+    spec_json           TEXT NOT NULL,
+    artifact_digest     TEXT NOT NULL,
+    canonical           INTEGER NOT NULL,
+    created_at          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS holdout_staging (
+    lock_hash               TEXT PRIMARY KEY REFERENCES research_locks(lock_hash),
+    holdout_training_hash   TEXT NOT NULL,
+    holdout_prediction_hash TEXT NOT NULL,
+    holdout_backtest_hash   TEXT NOT NULL,
+    fitted_state_digest     TEXT,
+    lineage_digest          TEXT NOT NULL,
+    staged_at               TEXT NOT NULL
+);
 """
 
 
@@ -395,23 +524,61 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
         if "stage" not in cols:
             db.execute("ALTER TABLE backtest_runs ADD COLUMN stage TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_backtest_stage ON backtest_runs(stage)")
+            cols.add("stage")
 
     # Migration 2: add runtime columns to training_runs
     if "training_runs" in tables:
         tr_cols = {row[1] for row in db.execute("PRAGMA table_info(training_runs)").fetchall()}
-        if "started_at" not in tr_cols:
-            db.execute("ALTER TABLE training_runs ADD COLUMN started_at TEXT")
-        if "elapsed_s" not in tr_cols:
-            db.execute("ALTER TABLE training_runs ADD COLUMN elapsed_s REAL")
-        if "runtime_json" not in tr_cols:
-            db.execute("ALTER TABLE training_runs ADD COLUMN runtime_json TEXT")
+        training_columns = {
+            "config_name": "TEXT",
+            "spec_json": "TEXT",
+            "git_commit": "TEXT",
+            "entry_point": "TEXT",
+            "started_at": "TEXT",
+            "elapsed_s": "REAL",
+            "runtime_json": "TEXT",
+            "identity_version": "INTEGER",
+            "execution_tier": "TEXT",
+        }
+        for column, sql_type in training_columns.items():
+            if column not in tr_cols:
+                db.execute(f"ALTER TABLE training_runs ADD COLUMN {column} {sql_type}")
+
+    if "prediction_sets" in tables:
+        prediction_cols = {
+            row[1] for row in db.execute("PRAGMA table_info(prediction_sets)").fetchall()
+        }
+        prediction_columns = {"checkpoint_value": "INTEGER", "checkpoint_kind": "TEXT"}
+        for column, sql_type in prediction_columns.items():
+            if column not in prediction_cols:
+                db.execute(f"ALTER TABLE prediction_sets ADD COLUMN {column} {sql_type}")
+
+    if "prediction_coverage" in tables:
+        coverage_cols = {
+            row[1] for row in db.execute("PRAGMA table_info(prediction_coverage)").fetchall()
+        }
+        if "schema_json" not in coverage_cols:
+            db.execute("ALTER TABLE prediction_coverage ADD COLUMN schema_json TEXT")
+        if "artifact_digest" not in coverage_cols:
+            db.execute("ALTER TABLE prediction_coverage ADD COLUMN artifact_digest TEXT")
 
     # Migration 2b: add runtime columns to backtest_runs
     if "backtest_runs" in tables:
-        if "started_at" not in cols:
-            db.execute("ALTER TABLE backtest_runs ADD COLUMN started_at TEXT")
-        if "elapsed_s" not in cols:
-            db.execute("ALTER TABLE backtest_runs ADD COLUMN elapsed_s REAL")
+        backtest_columns = {
+            "spec_json": "TEXT",
+            "stage": "TEXT",
+            "git_commit": "TEXT",
+            "started_at": "TEXT",
+            "elapsed_s": "REAL",
+            "artifact_digests_json": "TEXT",
+        }
+        for column, sql_type in backtest_columns.items():
+            if column not in cols:
+                db.execute(f"ALTER TABLE backtest_runs ADD COLUMN {column} {sql_type}")
+
+    for table in ("holdout_staging", "holdout_evaluations"):
+        if table in tables and not _table_has_column(db, table, "fitted_state_digest"):
+            db.execute(f"ALTER TABLE {table} ADD COLUMN fitted_state_digest TEXT")
 
     # Migration 3: tall → wide metric tables
     if "prediction_metrics" in tables:
@@ -773,7 +940,7 @@ def _upsert_wide_metrics(
     db: sqlite3.Connection,
     table: str,
     key_values: dict[str, object],
-    metrics: dict[str, float],
+    metrics: Mapping[str, object],
     computed_at: str | None = None,
 ) -> None:
     """Insert or update metric columns in a wide-format metrics table.

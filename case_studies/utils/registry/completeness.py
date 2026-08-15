@@ -50,6 +50,7 @@ silently reuse a partial state because the result would be misleading
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,138 @@ from .store import (
     _open_registry,
     _prediction_dir,
 )
+
+
+@dataclass(frozen=True)
+class PredictionCoverage:
+    """Exact expected-versus-actual prediction coverage evidence."""
+
+    expected_key_digest: str
+    actual_key_digest: str
+    n_expected: int
+    n_actual: int
+    n_duplicates: int
+    n_missing: int
+    n_extra: int
+    n_null: int
+    n_non_finite: int
+    n_folds_expected: int
+    n_folds_actual: int
+    schema_json: str
+    status: str
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "complete"
+
+    def as_dict(self) -> dict[str, str | int]:
+        return {
+            "expected_key_digest": self.expected_key_digest,
+            "actual_key_digest": self.actual_key_digest,
+            "n_expected": self.n_expected,
+            "n_actual": self.n_actual,
+            "n_duplicates": self.n_duplicates,
+            "n_missing": self.n_missing,
+            "n_extra": self.n_extra,
+            "n_null": self.n_null,
+            "n_non_finite": self.n_non_finite,
+            "n_folds_expected": self.n_folds_expected,
+            "n_folds_actual": self.n_folds_actual,
+            "schema_json": self.schema_json,
+            "status": self.status,
+        }
+
+
+def _prediction_key_columns(frame) -> tuple[str, ...]:
+    columns = set(frame.columns)
+    entities = [name for name in ("symbol", "product") if name in columns]
+    if len(entities) != 1:
+        raise ValueError("prediction coverage requires exactly one of symbol or product")
+    return (
+        entities[0],
+        *(("position",) if "position" in columns else ()),
+        "timestamp",
+        "fold_id",
+    )
+
+
+def _canonical_key_frame(frame, key_columns: tuple[str, ...] | None = None):
+    import polars as pl
+
+    if not isinstance(frame, pl.DataFrame):
+        frame = pl.from_pandas(frame)
+    if "fold" in frame.columns and "fold_id" not in frame.columns:
+        frame = frame.rename({"fold": "fold_id"})
+    if key_columns is None:
+        key_columns = _prediction_key_columns(frame)
+    required = set(key_columns)
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"prediction coverage requires columns {sorted(required)}; missing {missing}"
+        )
+    return frame.select(
+        *(
+            pl.col(name).cast(pl.Int64) if name == "fold_id" else pl.col(name).cast(pl.String)
+            for name in key_columns
+        )
+    )
+
+
+def _key_digest(frame, key_columns: tuple[str, ...]) -> str:
+    from case_studies.utils.artifact_digest import value_digest
+
+    return value_digest(frame, key_columns)
+
+
+def evaluate_prediction_coverage(expected_keys, predictions) -> PredictionCoverage:
+    """Compare exact prediction keys and finite scores without mutating storage."""
+    import polars as pl
+
+    expected = _canonical_key_frame(expected_keys)
+    key_columns = tuple(expected.columns)
+    actual = _canonical_key_frame(predictions, key_columns)
+    if expected.n_unique(key_columns) != expected.height:
+        raise ValueError("expected prediction coverage keys must be unique")
+
+    unique_actual = actual.unique(key_columns)
+    n_duplicates = actual.height - unique_actual.height
+    n_missing = expected.join(unique_actual, on=key_columns, how="anti").height
+    n_extra = unique_actual.join(expected, on=key_columns, how="anti").height
+
+    if not isinstance(predictions, pl.DataFrame):
+        predictions = pl.from_pandas(predictions)
+    score_col = "y_score" if "y_score" in predictions.columns else "prediction"
+    if score_col not in predictions.columns:
+        raise ValueError("prediction coverage requires y_score or prediction")
+    score = predictions.get_column(score_col).cast(pl.Float64, strict=False)
+    n_null = score.null_count()
+    n_non_finite = (score.is_not_null() & ~score.is_finite()).sum()
+    expected_digest = _key_digest(expected, key_columns)
+    actual_digest = _key_digest(unique_actual, key_columns)
+    complete = not any((n_duplicates, n_missing, n_extra, n_null, n_non_finite)) and (
+        expected_digest == actual_digest
+    )
+    return PredictionCoverage(
+        expected_key_digest=expected_digest,
+        actual_key_digest=actual_digest,
+        n_expected=expected.height,
+        n_actual=actual.height,
+        n_duplicates=n_duplicates,
+        n_missing=n_missing,
+        n_extra=n_extra,
+        n_null=n_null,
+        n_non_finite=int(n_non_finite),
+        n_folds_expected=expected.get_column("fold_id").n_unique(),
+        n_folds_actual=actual.get_column("fold_id").n_unique(),
+        schema_json=json.dumps(
+            {name: str(dtype) for name, dtype in predictions.schema.items()},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        status="complete" if complete else "partial",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses

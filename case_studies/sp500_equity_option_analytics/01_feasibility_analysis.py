@@ -39,7 +39,8 @@
 #   expiration calendar rather than from anything the strategy does
 # - See why a charge quoted per share and a charge quoted as a percentage are different assumptions
 #   about friction, not two units for the same one
-# - Read off one chart what fraction of price moves are larger than the cost of trading them
+# - Measure a move between the two prices a position is actually opened and closed at, then read
+#   off one chart what fraction of those moves are larger than the cost of trading them
 # - Measure how much of a ranking across stocks is left by the next decision date, computing the
 #   correlation between two orderings rather than inside a single stock's history
 # - Check that a walk-forward split fits the history available and leaves the test period unread
@@ -76,7 +77,7 @@ from case_studies.utils.feasibility import (
 from data import load_sp500_daily_bars, load_sp500_options_surface
 from utils.cv_splits import generate_cv_splits
 from utils.paths import get_case_study_dir
-from utils.style import COLORS, FIGSIZE, add_message_title
+from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
 warnings.filterwarnings("ignore")
 
@@ -127,11 +128,14 @@ PRIMARY_LABEL = SETUP["labels"]["primary"]
 LABEL_BUFFER = SETUP["labels"]["buffer"]
 BUFFER_SESSIONS = int(LABEL_BUFFER.rstrip("D"))
 HORIZONS = sorted({int(h.rstrip("D")) for h in SETUP["labels"]["horizons"].values()})
+PRIMARY_HORIZON = int(SETUP["labels"]["horizons"][PRIMARY_LABEL].rstrip("D"))
 BREADTH_FLOOR = max(SETUP["backtest"]["sweep"]["top_k_grid"][PRIMARY_LABEL])
 COST_BPS = SETUP["costs"]["round_trip_cost_bps"]
 PER_SHARE = SETUP["costs"]["per_share"]
 HALF_SPREADS = SETUP["backtest"]["sweep"]["cost_grid_half_spread_usd"]
 ATM_IV = "iv_30_atm"
+# Every series below is taken inside one security, as 02_labels and 03_financial_features do.
+SECURITY = "sec_id"
 DTE_LOW, DTE_HIGH = SETUP["features"]["surface"]["dte_buckets"]["30d"]
 IV_LAG = int(SETUP["decision"]["iv_feature_lag"].split("_")[0])
 IV_STALE = SETUP["features"]["windows"]["iv_forward_fill"]
@@ -236,12 +240,22 @@ print(
 #
 # The other assertion is that the summary holds at most one row per stock and session, since a
 # second would double that stock's weight in every average taken across the panel.
+#
+# The entity every series below is taken inside is the **security**, `sec_id`, not the ticker. A
+# ticker is reassigned after a merger or a spin-off, and it is also changed while the security
+# behind it stays the same, so a window bounded by the ticker either carries a dead company's
+# implied volatility into its successor or cuts a live company's history in half at a rename.
+# `02_labels` and `03_financial_features` both bound every window by `sec_id` for that reason, and
+# this notebook measures what they will build. The two counts printed below are what the
+# distinction costs: the tickers, and the securities behind them.
 
 # %%
 surface = load_sp500_options_surface(start_date=START_DATE, end_date=END_DATE)
 bars = load_sp500_daily_bars(start_date=START_DATE, end_date=END_DATE)
 development = pl.col("timestamp") < pl.lit(HOLDOUT_START).str.to_date()
-quotes = bars.filter(development).select("timestamp", "symbol", "sec_id", "close", "adj_factor")
+quotes = bars.filter(development).select(
+    "timestamp", "symbol", "sec_id", "open", "close", "adj_factor"
+)
 summary = surface.filter(development)
 
 assert not summary.select(pl.struct("symbol", "timestamp").is_duplicated().any()).item(), (
@@ -252,9 +266,10 @@ assert summary.select((pl.col(ATM_IV).drop_nulls() > 0).all()).item(), (
 )
 
 solved = summary.select("timestamp", "symbol", ATM_IV).drop_nulls(ATM_IV)
-panel = solved.join(quotes.drop("sec_id"), ["timestamp", "symbol"]).sort(["symbol", "timestamp"])
+panel = solved.join(quotes, ["timestamp", "symbol"]).sort([SECURITY, "timestamp"])
 print(
-    f"{panel['symbol'].n_unique()} stocks, {len(panel):,} stock-sessions over "
+    f"{panel['symbol'].n_unique()} tickers standing for {panel[SECURITY].n_unique()} securities, "
+    f"{len(panel):,} stock-sessions over "
     f"{panel['timestamp'].n_unique():,} sessions, {panel['timestamp'].min()} to "
     f"{panel['timestamp'].max()}\n"
     f"{summary[ATM_IV].null_count():,} of {len(summary):,} surface rows carry no implied "
@@ -284,13 +299,13 @@ for low, high in zip(PRICE_CUTS, PRICE_CUTS[1:], strict=False):
 label = label.otherwise(pl.lit(f"{PRICE_CUTS[-1]} and over"))
 
 n_sessions = quotes["timestamp"].n_unique()
-by_symbol = panel.group_by("symbol").agg(
+by_security = panel.group_by(SECURITY).agg(
     pl.col("close").median().alias("price"),
     (pl.col(ATM_IV) * 100).median().alias("implied_vol"),
     pl.len().alias("stock_sessions"),
 )
 groups = (
-    by_symbol.with_columns(label.alias("share_price"))
+    by_security.with_columns(label.alias("share_price"))
     .group_by("share_price")
     .agg(
         pl.len().alias("stocks"),
@@ -304,8 +319,8 @@ groups = (
 with pl.Config(tbl_rows=groups.height, tbl_cols=groups.width):
     display(groups)
 print(
-    f"Share price across the universe {by_symbol['price'].min():.2f} to "
-    f"{by_symbol['price'].max():.2f}, over {n_sessions:,} sessions"
+    f"Share price across the universe {by_security['price'].min():.2f} to "
+    f"{by_security['price'].max():.2f}, over {n_sessions:,} sessions"
 )
 
 # %% [markdown]
@@ -378,19 +393,21 @@ assert len({(d.year, d.month) for d in monthlies}) == len(monthlies), (
 # sessions, so the panel is placed on the session grid before either is applied. Shifting the rows
 # as they come would read "one session late" off a value up to a month old, and would spend the
 # five-session tolerance on five rows that can span far more than five sessions.
+#
+# The grid is the sessions each **security** traded, taken from the share bars, which is the grid
+# `03_financial_features::on_session_grid` reindexes the surface onto. Building it that way is what
+# keeps the lag and the fill from crossing a ticker changing hands: they are applied inside
+# `sec_id`, so a dead security's last quoted volatility is not carried into whichever company
+# picked the ticker up.
 
 # %%
-grid = (
-    summary.select("symbol")
-    .unique()
-    .join(quotes.select("timestamp").unique(), how="cross")
-    .join(summary.select("timestamp", "symbol", ATM_IV), on=["timestamp", "symbol"], how="left")
+grid = quotes.select("timestamp", "symbol", SECURITY).join(
+    summary.select("timestamp", "symbol", ATM_IV), on=["timestamp", "symbol"], how="left"
 )
 rankable = (
-    grid.sort(["symbol", "timestamp"])
-    .with_columns(pl.col(ATM_IV).shift(IV_LAG).forward_fill(limit=IV_STALE).over("symbol"))
+    grid.sort([SECURITY, "timestamp"])
+    .with_columns(pl.col(ATM_IV).shift(IV_LAG).forward_fill(limit=IV_STALE).over(SECURITY))
     .drop_nulls(ATM_IV)
-    .join(quotes.select("timestamp", "symbol"), ["timestamp", "symbol"])
 )
 decisions = rankable.group_by(pl.col("timestamp").dt.truncate("1w")).agg(
     pl.col("timestamp").max().alias("decision_date")
@@ -403,7 +420,7 @@ entries = rankable.join(decisions, left_on="timestamp", right_on="decision_date"
 breadth = (
     entries.group_by("timestamp")
     .agg(
-        pl.col("symbol").n_unique().alias("n_stocks"),
+        pl.col(SECURITY).n_unique().alias("n_stocks"),
         pl.col("monthly_in_window").first(),
     )
     .sort("timestamp")
@@ -430,7 +447,19 @@ add_message_title(
     "The universe doubles on the dates a monthly expiration is in reach",
     subtitle="Stocks with a lagged implied volatility and a share price, at each weekly decision",
 )
-plt.show()
+show_with_alt(
+    fig,
+    "Scatter of the number of stocks that can be ranked at each weekly decision date from 2017 "
+    "to the end of 2020, on an axis running to the declared universe of 633. The points fall "
+    "into two separate bands with nothing between them. Dates with a monthly expiration inside "
+    "the maturity window sit in a flat band just above five hundred stocks for the whole sample. "
+    "Dates carrying only weekly expirations sit in a lower band that starts near 210 in 2017, "
+    "steps up to about 260 early in 2018 and drifts back to about 250 by the end of 2020. A thin "
+    "grey line joins the points in date order and runs vertically between the two bands wherever "
+    "consecutive decision dates fall on opposite sides of the monthly cycle. The dashed rule "
+    "marking the twenty positions the book has to fill lies along the bottom of the chart, far "
+    "below every point in either band.",
+)
 
 # %% [markdown]
 # Breadth never approaches the floor, so it is not what limits this strategy. What the swing
@@ -454,12 +483,15 @@ plt.show()
 
 # %%
 prices = (
-    quotes.join(panel.select("symbol").unique(), on="symbol")
-    .with_columns((pl.col("close") * pl.col("adj_factor")).alias("adjusted"))
-    .sort(["symbol", "sec_id", "timestamp"])
+    quotes.join(panel.select(SECURITY).unique(), on=SECURITY)
+    .with_columns(
+        (pl.col("open") * pl.col("adj_factor")).alias("adj_open"),
+        (pl.col("close") * pl.col("adj_factor")).alias("adjusted"),
+    )
+    .sort([SECURITY, "timestamp"])
 )
 cost = (
-    prices.group_by("symbol")
+    prices.group_by(SECURITY)
     .agg(pl.col("close").median().alias("price"))
     .with_columns(
         (2 * (min(HALF_SPREADS) + PER_SHARE) / pl.col("price") * 1e4).alias("cheapest"),
@@ -483,7 +515,19 @@ add_message_title(
     "A per-share charge costs low-priced stocks orders of magnitude more",
     subtitle="Declared commission and half-spread over each stock's median quoted price",
 )
-plt.show()
+show_with_alt(
+    fig,
+    "Two rising curves on a logarithmic vertical axis, one stock per horizontal position, "
+    "ordered from the highest share price on the left to the lowest on the right, with the band "
+    "between them shaded. The lower curve is the commission-only cost: it starts near four "
+    "hundredths of a basis point, climbs steeply over the first few stocks, then rises gently "
+    "across the middle of the universe and turns up sharply among the last twenty or so, ending "
+    "around thirty. The upper curve is the widest declared half-spread and has the same shape "
+    "about a factor of thirty higher, starting near one basis point and ending just above six "
+    "hundred. The dashed horizontal rule at the declared thirteen basis points is crossed by the "
+    "upper curve about a sixth of the way along and by the lower curve only among the last few "
+    "stocks, so the shaded band straddles the rule across most of the universe.",
+)
 
 # %% [markdown]
 # The band crosses the flat line rather than sitting to one side of it, so no single figure in
@@ -491,12 +535,22 @@ plt.show()
 # percentage regime is the headline and the per-share regime is carried as a companion: the two are
 # different assumptions about what friction is, and Chapter 18 sweeps both rather than choosing.
 #
-# Against that cost sits the move in the share price itself. Returns run close to close on the
-# split- and dividend-adjusted series, and inside one security identity, so that a split does not
-# enter as a return and a ticker changing hands between two companies does not either. They are
-# measured over the stock-sessions the strategy could have ranked, which is the population the
-# question is about: a move in a stock the strategy could not have held that day is not an
-# opportunity it passed up.
+# Against that cost sits the move the strategy would have been holding through. It is measured
+# between the two prices a position is actually opened and closed at, which `decision` declares and
+# `02_labels` builds every label on: in at the adjusted open of the session after the decision,
+# out at the adjusted close $h$ sessions later. The decision close is one session earlier than the
+# first price the strategy can reach, so a move quoted from it contains the overnight gap between
+# reading the data and acting on it, which is a move no position was open for.
+#
+# Three things bound what is counted. Prices are adjusted for splits and dividends, so a corporate
+# action does not enter as a move. Every window is taken inside one security identity, so a ticker
+# changing hands between two companies does not either. And the window has to be complete on the
+# market's own session grid rather than on the security's rows, because a name that stops trading
+# for a fortnight has consecutive rows spanning a hole; $h$ rows would then not be $h$ sessions.
+# The windows are measured over the stock-sessions the strategy could have ranked, which is the
+# population the question is about: a move in a stock the strategy could not have held that day is
+# not an opportunity it passed up. The last few development sessions carry no window, because
+# theirs would resolve inside the holdout.
 #
 # The chart is an **exceedance curve**, and it reads from the right: for each magnitude on the
 # horizontal axis it gives the fraction of moves at least that large. Where it crosses the cost
@@ -506,13 +560,23 @@ plt.show()
 # question Chapter 7 onward asks.
 
 # %%
+# The session grid is the market's, so `h` counts trading sessions rather than surviving rows.
+grid_sessions = pl.DataFrame({"timestamp": sessions}).sort("timestamp").with_row_index("session")
+held = prices.join(grid_sessions, on="timestamp").sort([SECURITY, "session"])
+entry = pl.col("adj_open").shift(-1).over(SECURITY)
 returns = (
-    prices.with_columns(
-        (pl.col("adjusted").pct_change(h).abs().over(["symbol", "sec_id"]) * 1e4).alias(f"h{h}")
-        for h in HORIZONS
+    held.with_columns(
+        *[
+            pl.when(
+                (pl.col("session").shift(-h).over(SECURITY) - pl.col("session") == h) & (entry > 0)
+            )
+            .then((pl.col("adjusted").shift(-h).over(SECURITY) / entry - 1).abs() * 1e4)
+            .alias(f"h{h}")
+            for h in HORIZONS
+        ]
     )
-    .join(rankable.select("timestamp", "symbol"), ["timestamp", "symbol"])
-    .sort(["symbol", "timestamp"])
+    .join(rankable.select("timestamp", SECURITY), ["timestamp", SECURITY])
+    .sort([SECURITY, "session"])
 )
 
 fig, ax = plt.subplots(figsize=FIGSIZE["single"])
@@ -528,9 +592,18 @@ ax.legend(frameon=False, fontsize=8, loc="lower left")
 add_message_title(
     ax,
     "Moves at both horizons clear the declared round trip almost always",
-    subtitle="Exceedance of absolute adjusted returns over the stock-sessions that can be ranked",
+    subtitle="Exceedance of absolute returns on the sessions that can be ranked",
 )
-plt.show()
+show_with_alt(
+    fig,
+    "Two exceedance curves on a logarithmic horizontal axis of absolute move size in basis "
+    "points, the axis running from one to twenty thousand. Each gives the fraction of moves at "
+    "least as large as the magnitude beneath it, so both start flat at one on the left, fall "
+    "away through the hundreds, and reach zero a little past a thousand. The ten-session curve "
+    "lies above the five-session one throughout, meaning larger moves at every magnitude. The "
+    "dashed vertical rule at the declared thirteen basis point round trip sits far to the left "
+    "of where either curve begins to fall, so both are still close to one where they cross it.",
+)
 
 # %% [markdown]
 # ### B.4 How much of the ranking is left at the next decision
@@ -559,7 +632,7 @@ plt.show()
 persistence = cross_sectional_persistence(
     entries,
     time_col="timestamp",
-    entity_col="symbol",
+    entity_col=SECURITY,
     value_col=ATM_IV,
     max_lags=PERSISTENCE_WEEKS,
 )
@@ -602,7 +675,17 @@ add_message_title(
     "Most of the ranking is still there a week later",
     subtitle="Correlation of the implied volatility ordering between decision dates",
 )
-plt.show()
+show_with_alt(
+    fig,
+    "Line with markers showing the correlation between two implied volatility orderings against "
+    "the number of decision dates separating them, from one to eight, on a vertical axis from "
+    "zero to one. It starts a little above nine tenths at one week, falls fastest over the first "
+    "four weeks, and then flattens near three quarters for the rest of the axis. A shaded band "
+    "gives the tenth to ninetieth percentile across pairs of dates; it is barely visible at one "
+    "week and widens with the lag, spanning roughly 0.68 to 0.83 by eight. A second shaded band "
+    "along the bottom of the axis, reaching about 0.11, is the range expected between unrelated "
+    "orderings of this many stocks, and the curve stays far above it at every lag.",
+)
 
 # %% [markdown]
 # ### B.5 Move size against cost
@@ -619,7 +702,7 @@ plt.show()
 # position.
 
 # %%
-primary = f"h{HORIZONS[0]}"
+primary = f"h{PRIMARY_HORIZON}"
 median_move, above_cost = (
     returns.drop_nulls(primary)
     .select(pl.col(primary).median(), (pl.col(primary) > COST_BPS).mean().alias("share"))
@@ -627,8 +710,8 @@ median_move, above_cost = (
 )
 one_week = persistence.filter(pl.col("lag") == 1)["rho"][0]
 print(
-    f"Median {HORIZONS[0]}-session move {median_move:.0f} bps, {median_move / COST_BPS:.0f}x the "
-    f"declared {COST_BPS} bps round trip, and {above_cost:.3f} of moves are larger than it\n"
+    f"Median {PRIMARY_HORIZON}-session move {median_move:.0f} bps, {median_move / COST_BPS:.0f}x "
+    f"the declared {COST_BPS} bps round trip, and {above_cost:.3f} of moves are larger than it\n"
     f"Priced per share instead, the same round trip runs from {cost['cheapest'].min():.2f} bps on "
     f"the most expensive stock to {cost['dearest'].max():.0f} bps on the cheapest\n"
     f"The ranking correlates {one_week:.2f} with itself one decision date later, "
@@ -636,8 +719,8 @@ print(
 )
 
 # %% [markdown] tags=["results"]
-# The median absolute five-session move is 211 bps, sixteen times the declared 13 bps round trip,
-# and 0.964 of moves exceed it. Priced per share instead, the same round trip runs from 0.04 bps on
+# The median absolute five-session move is 209 bps, sixteen times the declared 13 bps round trip,
+# and 0.965 of moves exceed it. Priced per share instead, the same round trip runs from 0.04 bps on
 # the most expensive stock to 619 bps on the cheapest. The implied volatility ordering correlates
 # 0.92 with itself one decision date later and 0.75 after eight.
 
@@ -675,10 +758,16 @@ print(
 #
 # The other two are outcomes of the strategy rather than properties of the data, and neither can be
 # settled at this stage. Chapter 7 asks whether the ranking has any relationship at all to the
-# returns that follow it. Chapter 11 asks the question specific to this case study: the option
-# market's opinion has to be worth more than the share price history that is free, so the
-# volatility features have to add something over realized volatility and momentum computed from the
-# bars alone. If they do not, the option data is an expensive way to rebuild a price signal.
+# returns that follow it.
+#
+# The question specific to this case study is whether the option market's opinion is worth more
+# than the share price history that is free, and the stages ahead do not settle it. From Chapter 11
+# on, every model is fitted on the option-derived and the price-derived columns together, so what
+# those stages report is how far each column carries a model that was given both, never what the
+# same model would have done on the price columns alone. Separating the two takes a second fit with
+# the option columns withheld, and no notebook here runs one;
+# [`13_model_analysis`](13_model_analysis.ipynb), which compares the model families on this data,
+# records the same limit against its own importance ranking.
 #
 # ### C.3 What the strategy does with the ranking
 #
@@ -766,7 +855,16 @@ add_message_title(
     "Both folds roll forward and end before the holdout opens",
     subtitle="Boundaries as generate_cv_splits returned them; the purge gap separates each pair",
 )
-plt.show()
+show_with_alt(
+    fig,
+    "Timeline with one row per walk-forward fold, drawn earliest first and labelled with the "
+    "fold number the splitter assigned, so the labels count down. Each row carries a two-year "
+    "training bar followed by a one-year validation bar. Fold 1 trains from the start of 2017 "
+    "to the end of 2018 and validates through 2019; fold 0 trains from the start of 2018 to the "
+    "end of 2019 and validates through 2020, each shifted one year later than the row above it. "
+    "The ten sessions of purging between each pair are too narrow to separate the bars at this "
+    "scale. A shaded holdout region covers 2021 and neither fold's bars reach it.",
+)
 
 # %% [markdown]
 # ## E. What this notebook hands on
@@ -791,7 +889,7 @@ plt.show()
 # %%
 thin = breadth.filter(pl.col("n_stocks") < BREADTH_FLOOR)
 print(
-    f"universe.n_assets {SETUP['universe']['n_assets']}, {panel['symbol'].n_unique()} stocks "
+    f"universe.n_assets {SETUP['universe']['n_assets']}, {panel[SECURITY].n_unique()} securities "
     f"quoted a solved implied volatility, {breadth['n_stocks'].min()} to "
     f"{breadth['n_stocks'].max()} of them per decision date, below the {BREADTH_FLOOR} the book "
     f"needs on {thin.height} of {len(breadth)} dates\n"
@@ -806,11 +904,12 @@ print(
 )
 
 # %% [markdown] tags=["results"]
-# 609 stocks quote a solved implied volatility over the development period, and between 213 and 503
-# of them can be ranked on a decision date, against a declared universe of 633 and a book of 20
-# that no date comes close to failing to fill. The declared 13 bps round trip is the same charge as
-# anything from 0.04 to 619 bps if it is levied per share instead. Two folds are generated, the
-# last validation ending 2020-12-23, ten sessions of purging at every boundary.
+# 599 securities, trading under 609 tickers, quote a solved implied volatility over the development
+# period, and between 213 and 503 of them can be ranked on a decision date, against a declared
+# universe of 633 and a book of 20 that no date comes close to failing to fill. The declared 13 bps
+# round trip is the same charge as anything from 0.04 to 619 bps if it is levied per share instead.
+# Two folds are generated, the last validation ending 2020-12-23, ten sessions of purging at every
+# boundary.
 
 # %% [markdown]
 # ## Key takeaways

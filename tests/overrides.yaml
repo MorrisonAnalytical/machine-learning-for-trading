@@ -780,9 +780,13 @@
     MAX_SYMBOLS: 10
   timeout: 300
 18_transaction_costs/03_market_impact_calibration:
+  # No NQ100_SYMBOLS override. The notebook's default of 100 selects every symbol
+  # the fixture carries, which is 6, and the cross-sectional inference needs >= 4
+  # of them to have a positive normalized coefficient. Cutting the sample to 5
+  # dropped GOOGL and left exactly 3. The reduction was ours and it cost nothing
+  # to keep: the fixture has 6 symbols either way.
   parameters:
     MAX_SYMBOLS: 10
-    NQ100_SYMBOLS: 5
   timeout: 300
 18_transaction_costs/04_vwap_twap_execution:
   timeout: 300
@@ -881,7 +885,6 @@
     TOTAL_TIMESTEPS: 1000
   timeout: 600
 21_rl_execution_hedging/05_deep_hedging_pfhedge:
-  docker_env: py312
   gpu: true
   parameters:
     N_EPOCHS: 2
@@ -1151,14 +1154,19 @@ case_studies/cme_futures/04_model_based_features:
   # MAX_PRODUCTS: 0 - every product, not a sample. 05_evaluation keeps a date only where
   # ten products carry the feature, so a fixture covering three of the thirty leaves the
   # temporal features under the coverage gate and scores nothing.
+  #
+  # ARIMA_REFIT_FREQ is what bounds this notebook in CI. Neither of the other two levers
+  # is available: MAX_PRODUCTS is held at 0 by the coverage gate above, and MAX_FOLDS
+  # slices `splits` so a reduced artifact fails 06-09 and 11 at "artifact fold is
+  # missing". The job timed out here at the 1800s cell limit on 2026-08-10 (run
+  # 31353597681), in the walk-forward cell and not in the FFT one - FFT_WINDOW bounds the
+  # spectral features and never bounded this. Re-selecting the ARIMA order annually
+  # rather than monthly cuts the stepwise searches twelvefold and leaves the number of
+  # forecasts, and so the row count every downstream gate reads, exactly as it was.
   parameters:
     FFT_WINDOW: 126
     MAX_PRODUCTS: 0
-  skip: true
-  skip_reason: ARIMA/HMM/FFT across all 30 products and 5 folds is 20 minutes locally (measured 2026-08-05, 1,188s),
-    and longer on the slower pymc 5.28 / pytensor 2.38 / numpy 2.3 stack CI runs. Downstream notebooks consume the
-    pre-seeded test-data/intermediates/cme_futures/features instead. That fixture is only as current as the last time
-    someone regenerated it with these parameters, and nothing here detects when it drifts from what 05_evaluation reads.
+    ARIMA_REFIT_FREQ: 252
   timeout: 1800
 case_studies/cme_futures/05_evaluation:
   # No MAX_SYMBOLS. The cross-sectional IC in Section 4 keeps a date only when at least
@@ -1260,7 +1268,6 @@ case_studies/crypto_perps_funding/06_linear:
     MAX_SYMBOLS: 5
   timeout: 120
 case_studies/crypto_perps_funding/07_gbm:
-  gpu: true
   parameters:
     MAX_FOLDS: 2
     MAX_SYMBOLS: 5
@@ -1368,8 +1375,8 @@ case_studies/etfs/09_dl_lstm:
     BATCH_SIZE: 32
     LOOKBACK: 5
     MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    MAX_SYMBOLS: 6
+    N_EPOCHS: 6
   timeout: 180
 case_studies/etfs/10_dl_tsmixer:
   # LOOKBACK becomes the Darts input_chunk_length, which must exceed
@@ -1382,8 +1389,8 @@ case_studies/etfs/10_dl_tsmixer:
     BATCH_SIZE: 32
     LOOKBACK: 22
     MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    MAX_SYMBOLS: 6
+    N_EPOCHS: 2
   timeout: 180
 case_studies/etfs/11a_pca:
   # MAX_SYMBOLS must match 04_model_based_features, which builds the temporal
@@ -1447,17 +1454,13 @@ case_studies/fx_pairs/01_feasibility_analysis:
 case_studies/fx_pairs/02_labels:
   timeout: 120
 case_studies/fx_pairs/03_financial_features:
-  parameters:
-    START_DATE: '2000-01-01'
   timeout: 300
 case_studies/fx_pairs/04_model_based_features:
   parameters:
     KALMAN_MAXITER: 50
-    MAX_FOLDS: 2
     MAX_SYMBOLS: 5
     N_HMM_RESTARTS: 3
-    START_DATE: '2000-01-01'
-  timeout: 300
+  timeout: 900
 case_studies/fx_pairs/05_evaluation:
   parameters:
     MAX_SYMBOLS: 5
@@ -1642,9 +1645,9 @@ case_studies/sp500_equity_option_analytics/02_labels:
 case_studies/sp500_equity_option_analytics/03_financial_features:
   timeout: 120
 case_studies/sp500_equity_option_analytics/04_model_based_features:
-  # MIN_OBS: 10 removed - the notebook repeats `MIN_OBS = 252` below the
-  # parameters cell, so the injected value was gone before any function
-  # that reads it could run.
+  parameters:
+    MAX_SYMBOLS: 5
+    MIN_OBS: 10
   timeout: 300
 case_studies/sp500_equity_option_analytics/05_evaluation:
   parameters:
@@ -1802,7 +1805,6 @@ case_studies/sp500_options/04_model_based_features:
   # What is safe to reduce is how many times that sampler runs and how finely the
   # filter resolves: the pool is the per-fold MCMC fit count (10 -> 2) and the
   # particle count is the filter's resolution over every segment (1000 -> 100).
-  gpu: true
   parameters:
     SV_N_PARTICLES: 100
     SV_POOL_SIZE: 2

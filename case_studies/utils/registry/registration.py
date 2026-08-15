@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
+import uuid
 from pathlib import Path
+from typing import Any
 
 from .specs import (
+    SUPPORTED_IDENTITY_VERSIONS,
+    _hashable_strategy_spec,
     _validate_spec,
     backtest_hash_from_parts,
     build_training_spec,
     canonical_json,
     prediction_hash_from_parts,
+    project_training_identity,
     training_hash_from_spec,
 )
 from .store import (
@@ -31,6 +38,92 @@ from .store import (
 logger = logging.getLogger(__name__)
 
 VALID_PREDICTION_SPLITS = frozenset({"validation", "holdout"})
+MAX_PREDICTION_STD_RATIO = 100.0
+
+
+def _atomic_save_json(path: Path, data: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        _save_json(temporary, data)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_prediction_dispersion(predictions) -> None:
+    """Reject a prediction set with an implausible score scale on any fold.
+
+    The bound is deliberately wide. Across 8,090 finite folds in the nine
+    production registries, the largest fold below the failure population was
+    72.72. The known divergent folds started at 187.41 and extended to
+    9.22e39. Rank correlation cannot detect this failure because it is invariant
+    to score scale.
+    """
+    import math
+
+    import polars as pl
+
+    if not isinstance(predictions, pl.DataFrame):
+        predictions = pl.from_pandas(predictions)
+
+    fold_col = _detect_fold_col(predictions)
+    y_true_col, y_score_col = _detect_score_cols(predictions)
+    if fold_col is None or not {y_true_col, y_score_col}.issubset(predictions.columns):
+        return
+
+    typed = predictions.lazy().select(
+        pl.col(fold_col).alias("fold"),
+        pl.col(y_true_col).cast(pl.Float64, strict=False).alias("actual"),
+        pl.col(y_score_col).cast(pl.Float64, strict=False).alias("score"),
+    )
+    fold_health = (
+        typed.group_by("fold")
+        .agg(
+            pl.len().alias("n_total"),
+            pl.col("score").is_finite().sum().alias("n_finite"),
+        )
+        .collect()
+    )
+    invalid_folds = []
+    for row in fold_health.iter_rows(named=True):
+        n_invalid = row["n_total"] - row["n_finite"]
+        if n_invalid:
+            invalid_folds.append(f"fold {row['fold']}: {n_invalid} non-finite score(s)")
+    if invalid_folds:
+        raise ValueError(
+            "Refusing to register predictions with a non-finite fold: " + "; ".join(invalid_folds)
+        )
+
+    dispersion = (
+        typed.filter(pl.col("actual").is_finite() & pl.col("score").is_finite())
+        .group_by("fold")
+        .agg(
+            pl.len().alias("n"),
+            pl.col("actual").std().alias("actual_std"),
+            pl.col("score").std().alias("score_std"),
+        )
+        .collect()
+    )
+
+    violations = []
+    for row in dispersion.iter_rows(named=True):
+        actual_std = row["actual_std"]
+        score_std = row["score_std"]
+        if row["n"] < 2 or actual_std is None or actual_std <= 0 or score_std is None:
+            continue
+        ratio = float(score_std / actual_std)
+        if not math.isfinite(ratio) or ratio > MAX_PREDICTION_STD_RATIO:
+            violations.append(
+                f"fold {row['fold']}: prediction dispersion ratio {ratio:.6g} "
+                f"(score std {score_std:.6g} / target std {actual_std:.6g})"
+            )
+
+    if violations:
+        raise ValueError(
+            "Refusing to register predictions with a diverged fold; "
+            f"the maximum allowed per-fold dispersion ratio is "
+            f"{MAX_PREDICTION_STD_RATIO:g}: " + "; ".join(violations)
+        )
 
 
 def clear_prediction_sets(
@@ -105,6 +198,10 @@ def clear_prediction_sets(
             prediction_hashes,
         )
         db.execute(
+            f"DELETE FROM prediction_coverage WHERE prediction_hash IN ({placeholders})",
+            prediction_hashes,
+        )
+        db.execute(
             f"DELETE FROM prediction_sets WHERE prediction_hash IN ({placeholders})",
             prediction_hashes,
         )
@@ -165,6 +262,98 @@ def register_training_run(
     spec = _validate_spec(spec)
     t_hash = training_hash_from_spec(spec)
     spec_json_str = canonical_json(spec)
+
+    if spec.get("identity_version") in SUPPORTED_IDENTITY_VERSIONS:
+        identity_version = int(spec["identity_version"])
+        tier = spec.get("execution_tier")
+        if tier not in {"canonical", "preview"}:
+            raise ValueError("versioned training spec requires execution_tier canonical or preview")
+        db = _open_registry(case_dir)
+        try:
+            existing = db.execute(
+                "SELECT spec_json, identity_version, execution_tier FROM training_runs "
+                "WHERE training_hash = ?",
+                (t_hash,),
+            ).fetchone()
+            if existing is not None:
+                existing_spec = json.loads(existing[0])
+                if project_training_identity(existing_spec) != project_training_identity(
+                    spec
+                ) or existing[1:] != (identity_version, tier):
+                    raise ValueError(f"immutable training identity conflict for {t_hash}")
+                spec_path = _training_dir(case_dir, t_hash) / "spec.json"
+                try:
+                    artifact_spec = json.loads(spec_path.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"immutable training spec artifact conflict for {t_hash}"
+                    ) from exc
+                if artifact_spec != existing_spec:
+                    raise ValueError(f"immutable training spec artifact conflict for {t_hash}")
+                return t_hash
+
+            train_dir = _training_dir(case_dir, t_hash)
+            spec_path = train_dir / "spec.json"
+            if spec_path.exists():
+                try:
+                    orphaned_spec = json.loads(spec_path.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"immutable training spec artifact conflict for {t_hash}"
+                    ) from exc
+                if orphaned_spec != spec:
+                    raise ValueError(f"immutable training spec artifact conflict for {t_hash}")
+            else:
+                _atomic_save_json(spec_path, spec)
+            if runtime_provenance is not None:
+                runtime_path = train_dir / "runtime.json"
+                if runtime_path.exists():
+                    try:
+                        orphaned_runtime = json.loads(runtime_path.read_text())
+                    except (OSError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            f"immutable training runtime artifact conflict for {t_hash}"
+                        ) from exc
+                    if orphaned_runtime != runtime_provenance:
+                        raise ValueError(
+                            f"immutable training runtime artifact conflict for {t_hash}"
+                        )
+                else:
+                    _atomic_save_json(runtime_path, runtime_provenance)
+            try:
+                db.execute(
+                    """
+                    INSERT INTO training_runs
+                    (training_hash, family, label, config_name, spec_json, created_at,
+                     git_commit, entry_point, started_at, elapsed_s, runtime_json,
+                     identity_version, execution_tier)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        t_hash,
+                        spec["family"],
+                        spec["label"],
+                        spec.get("config_name"),
+                        spec_json_str,
+                        _utc_now(),
+                        _git_hash(),
+                        entry_point,
+                        started_at,
+                        elapsed_s,
+                        canonical_json(runtime_provenance)
+                        if runtime_provenance is not None
+                        else None,
+                        identity_version,
+                        tier,
+                    ),
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        finally:
+            db.close()
+        return t_hash
 
     # Write spec.json (authoritative identity artifact)
     train_dir = _training_dir(case_dir, t_hash)
@@ -423,6 +612,8 @@ def register_prediction_set(
     eval_col: str | None = None,
     label: str | None = None,
     case_dir: Path | None = None,
+    expected_keys=None,
+    allow_partial: bool = False,
 ) -> str:
     """Register a prediction set. Returns prediction_hash.
 
@@ -468,45 +659,189 @@ def register_prediction_set(
     if case_dir is None:
         case_dir = _case_dir(case_study)
 
-    p_hash = prediction_hash_from_parts(training_hash, checkpoint_value, split)
-
-    # Save predictions
     if predictions is not None:
-        pred_dir = _prediction_dir(case_dir, p_hash)
-        _save_parquet(pred_dir / "predictions.parquet", predictions)
+        _validate_prediction_dispersion(predictions)
 
-    # Insert into DB
     db = _open_registry(case_dir)
     try:
-        db.execute(
-            """
-            INSERT OR REPLACE INTO prediction_sets
-            (prediction_hash, training_hash, checkpoint_value, checkpoint_kind,
-             split, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                p_hash,
-                training_hash,
-                checkpoint_value,
-                checkpoint_kind,
-                split,
-                _utc_now(),
-            ),
-        )
-
-        if metrics:
-            _upsert_wide_metrics(db, "prediction_metrics", {"prediction_hash": p_hash}, metrics)
-
-        db.commit()
+        parent = db.execute(
+            "SELECT identity_version, execution_tier FROM training_runs WHERE training_hash = ?",
+            (training_hash,),
+        ).fetchone()
     finally:
         db.close()
+    if parent is None:
+        raise ValueError(f"unknown training_hash {training_hash}")
+    identity_version, _execution_tier = parent
+    coverage = None
+    if identity_version in SUPPORTED_IDENTITY_VERSIONS:
+        if predictions is None or expected_keys is None:
+            raise ValueError(
+                "versioned prediction registration requires predictions and expected_keys"
+            )
+        from .completeness import evaluate_prediction_coverage
+
+        coverage = evaluate_prediction_coverage(expected_keys, predictions)
+        if not coverage.complete and not allow_partial:
+            raise ValueError(f"prediction coverage is partial: {coverage.as_dict()}")
+        db = _open_registry(case_dir)
+        try:
+            existing_schema = db.execute(
+                """
+                SELECT c.schema_json
+                FROM prediction_coverage c
+                JOIN prediction_sets p ON p.prediction_hash = c.prediction_hash
+                WHERE p.training_hash = ? AND p.split = ?
+                LIMIT 1
+                """,
+                (training_hash, split),
+            ).fetchone()
+        finally:
+            db.close()
+        if existing_schema is not None and existing_schema[0] != coverage.schema_json:
+            raise ValueError("prediction schema differs from an existing checkpoint")
+
+    p_hash = prediction_hash_from_parts(
+        training_hash,
+        checkpoint_value,
+        split,
+        checkpoint_kind=checkpoint_kind,
+        identity_version=identity_version,
+    )
+
+    if identity_version in SUPPORTED_IDENTITY_VERSIONS:
+        assert coverage is not None
+        import polars as pl
+
+        from case_studies.utils.artifact_digest import value_digest
+
+        normalized_predictions = (
+            predictions if isinstance(predictions, pl.DataFrame) else pl.from_pandas(predictions)
+        )
+        prediction_artifact_digest = value_digest(normalized_predictions)
+        pred_dir = _prediction_dir(case_dir, p_hash)
+        pred_path = pred_dir / "predictions.parquet"
+        temporary = pred_dir / f".predictions.{uuid.uuid4().hex}.tmp"
+        db = _open_registry(case_dir)
+        created_artifact = False
+        try:
+            existing = db.execute(
+                "SELECT training_hash, checkpoint_value, checkpoint_kind, split "
+                "FROM prediction_sets WHERE prediction_hash = ?",
+                (p_hash,),
+            ).fetchone()
+            expected_row = (training_hash, checkpoint_value, checkpoint_kind, split)
+            if existing is not None:
+                if existing != expected_row:
+                    raise ValueError(f"immutable prediction identity conflict for {p_hash}")
+                if (
+                    not pred_path.exists()
+                    or value_digest(pl.read_parquet(pred_path)) != prediction_artifact_digest
+                ):
+                    raise ValueError(f"immutable prediction artifact conflict for {p_hash}")
+                recorded_digest = db.execute(
+                    "SELECT artifact_digest FROM prediction_coverage WHERE prediction_hash = ?",
+                    (p_hash,),
+                ).fetchone()
+                if recorded_digest is None:
+                    raise ValueError(f"prediction {p_hash} has no coverage record")
+                if recorded_digest[0] not in (None, prediction_artifact_digest):
+                    raise ValueError(f"immutable prediction digest conflict for {p_hash}")
+                if recorded_digest[0] is None:
+                    db.execute(
+                        "UPDATE prediction_coverage SET artifact_digest = ? "
+                        "WHERE prediction_hash = ? AND artifact_digest IS NULL",
+                        (prediction_artifact_digest, p_hash),
+                    )
+                    db.commit()
+            else:
+                if pred_path.exists():
+                    try:
+                        orphaned_digest = value_digest(pl.read_parquet(pred_path))
+                    except (OSError, ValueError, pl.exceptions.PolarsError) as exc:
+                        raise ValueError(
+                            f"immutable prediction artifact conflict for {p_hash}"
+                        ) from exc
+                    if orphaned_digest != prediction_artifact_digest:
+                        raise ValueError(f"immutable prediction artifact conflict for {p_hash}")
+                else:
+                    _save_parquet(temporary, predictions)
+                try:
+                    db.execute(
+                        """
+                        INSERT INTO prediction_sets
+                        (prediction_hash, training_hash, checkpoint_value, checkpoint_kind,
+                         split, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (p_hash, *expected_row, _utc_now()),
+                    )
+                    values = coverage.as_dict()
+                    values["artifact_digest"] = prediction_artifact_digest
+                    columns = ", ".join(("prediction_hash", *values))
+                    placeholders = ", ".join("?" for _ in range(len(values) + 1))
+                    db.execute(
+                        f"INSERT INTO prediction_coverage ({columns}) VALUES ({placeholders})",
+                        (p_hash, *values.values()),
+                    )
+                    if metrics:
+                        _upsert_wide_metrics(
+                            db, "prediction_metrics", {"prediction_hash": p_hash}, metrics
+                        )
+                    pred_dir.mkdir(parents=True, exist_ok=True)
+                    if not pred_path.exists():
+                        os.replace(temporary, pred_path)
+                        created_artifact = True
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    if created_artifact:
+                        pred_path.unlink(missing_ok=True)
+                    raise
+        finally:
+            temporary.unlink(missing_ok=True)
+            db.close()
+    else:
+        # Save predictions
+        if predictions is not None:
+            pred_dir = _prediction_dir(case_dir, p_hash)
+            _save_parquet(pred_dir / "predictions.parquet", predictions)
+
+        # Insert into DB
+        db = _open_registry(case_dir)
+        try:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO prediction_sets
+                (prediction_hash, training_hash, checkpoint_value, checkpoint_kind,
+                 split, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    p_hash,
+                    training_hash,
+                    checkpoint_value,
+                    checkpoint_kind,
+                    split,
+                    _utc_now(),
+                ),
+            )
+
+            if metrics:
+                _upsert_wide_metrics(db, "prediction_metrics", {"prediction_hash": p_hash}, metrics)
+
+            db.commit()
+        finally:
+            db.close()
 
     # Auto-compute fold metrics when predictions are provided
     if predictions is not None and _has_fold_column(predictions):
         try:
             fold_col = _detect_fold_col(predictions)
+            assert fold_col is not None
             y_true_col, y_score_col = _detect_score_cols(predictions)
+            prediction_columns = set(predictions.columns)
+            metric_entity_col = "product" if "product" in prediction_columns else "symbol"
             # Resolve label from training_runs if caller didn't supply it.
             resolved_label = label
             if not resolved_label:
@@ -526,6 +861,7 @@ def register_prediction_set(
                 y_true_col=y_true_col,
                 y_score_col=y_score_col,
                 fold_col=fold_col,
+                entity_col=metric_entity_col,
                 task_type=task_type,
                 class_values=class_values,
                 eval_col=eval_col,
@@ -537,6 +873,8 @@ def register_prediction_set(
             # Store per-fold metrics
             register_fold_metrics(case_study, p_hash, fold_m, case_dir=case_dir)
         except Exception as exc:
+            if identity_version in SUPPORTED_IDENTITY_VERSIONS:
+                raise
             logger.warning("Could not compute fold metrics for %s: %s", p_hash, exc)
 
     return p_hash
@@ -694,36 +1032,184 @@ def register_backtest_run(
     if stage is None:
         stage = _infer_stage(strategy_spec, case_dir=case_dir, prediction_hash=prediction_hash)
 
-    b_hash = backtest_hash_from_parts(prediction_hash, strategy_spec)
-    spec_json_str = canonical_json(strategy_spec)
+    identity_version = strategy_spec.get("identity_version")
+    if identity_version in SUPPORTED_IDENTITY_VERSIONS:
+        db = _open_registry(case_dir)
+        try:
+            ancestry = db.execute(
+                """
+                SELECT t.execution_tier, c.status
+                FROM prediction_sets p
+                JOIN training_runs t ON t.training_hash = p.training_hash
+                LEFT JOIN prediction_coverage c ON c.prediction_hash = p.prediction_hash
+                WHERE p.prediction_hash = ?
+                """,
+                (prediction_hash,),
+            ).fetchone()
+        finally:
+            db.close()
+        if ancestry is None or ancestry[1] != "complete":
+            raise ValueError("backtest requires complete prediction coverage")
+        requested_tier = strategy_spec.get("execution_tier", "canonical")
+        if requested_tier not in {"canonical", "preview"}:
+            raise ValueError("backtest execution_tier must be canonical or preview")
+        if ancestry[0] != requested_tier:
+            raise ValueError("backtest execution tier conflicts with prediction ancestry")
+
+    b_hash = backtest_hash_from_parts(
+        prediction_hash, strategy_spec, identity_version=identity_version
+    )
+    stored_strategy_spec = dict(strategy_spec)
+    stored_strategy_spec.pop("_runtime_backtest_config", None)
+    spec_json_str = canonical_json(stored_strategy_spec)
+    existing_strategy_spec: dict | None = None
+    existing_backtest = False
+    bt_dir = _backtest_dir(case_dir, b_hash)
+    spec_path = bt_dir / "spec.json"
+
+    db = _open_registry(case_dir)
+    try:
+        existing = db.execute(
+            "SELECT prediction_hash, spec_json, "
+            "EXISTS(SELECT 1 FROM backtest_metrics m WHERE m.backtest_hash = ?), "
+            "artifact_digests_json FROM backtest_runs WHERE backtest_hash = ?",
+            (b_hash, b_hash),
+        ).fetchone()
+    finally:
+        db.close()
+    if existing is not None:
+        existing_backtest = True
+        existing_spec = json.loads(existing[1] or "{}")
+        if identity_version in SUPPORTED_IDENTITY_VERSIONS:
+            same_identity = canonical_json(
+                _hashable_strategy_spec(existing_spec)
+            ) == canonical_json(_hashable_strategy_spec(strategy_spec))
+            if existing[0] != prediction_hash or not same_identity:
+                raise ValueError(f"immutable backtest identity conflict for {b_hash}")
+        existing_strategy_spec = existing_spec
+        if spec_path.is_file():
+            try:
+                artifact_spec = json.loads(spec_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"immutable backtest spec artifact conflict for {b_hash}") from exc
+            artifact_spec.pop("_runtime_backtest_config", None)
+            if canonical_json(artifact_spec) != canonical_json(existing_spec):
+                raise ValueError(f"immutable backtest spec artifact conflict for {b_hash}")
+        import polars as pl
+
+        from case_studies.utils.artifact_digest import value_digest
+
+        artifact_values = {
+            "daily_returns.parquet": returns,
+            "trades.parquet": trades,
+            "fills.parquet": fills,
+            "equity.parquet": equity,
+            "portfolio_state.parquet": portfolio_state,
+            "weights.parquet": weights,
+        }
+        for filename, value in artifact_values.items():
+            if value is None:
+                continue
+            new_frame = value if isinstance(value, pl.DataFrame) else pl.from_pandas(value)
+            existing_path = _backtest_dir(case_dir, b_hash) / filename
+            if existing_path.exists() and value_digest(
+                pl.read_parquet(existing_path)
+            ) != value_digest(new_frame):
+                raise ValueError(f"immutable backtest artifact conflict for {b_hash}")
+        existing_returns = _backtest_dir(case_dir, b_hash) / "daily_returns.parquet"
+        try:
+            recorded_digests = json.loads(existing[3] or "")
+        except (json.JSONDecodeError, TypeError):
+            recorded_digests = None
+        digests_valid = (
+            isinstance(recorded_digests, dict) and "daily_returns.parquet" in recorded_digests
+        )
+        if digests_valid:
+            for filename, expected_digest in recorded_digests.items():
+                path = existing_returns.parent / filename
+                if not path.is_file() or value_digest(pl.read_parquet(path)) != expected_digest:
+                    digests_valid = False
+                    break
+        if (
+            identity_version in SUPPORTED_IDENTITY_VERSIONS
+            and existing_returns.exists()
+            and existing[2]
+            and digests_valid
+        ):
+            return b_hash
 
     # Write spec.json
-    bt_dir = _backtest_dir(case_dir, b_hash)
-    _save_json(bt_dir / "spec.json", strategy_spec)
+    expected_artifact_spec = (
+        existing_strategy_spec if existing_strategy_spec is not None else stored_strategy_spec
+    )
+    if spec_path.exists():
+        try:
+            artifact_spec = json.loads(spec_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"immutable backtest spec artifact conflict for {b_hash}") from exc
+        artifact_spec.pop("_runtime_backtest_config", None)
+        if canonical_json(artifact_spec) != canonical_json(expected_artifact_spec):
+            raise ValueError(f"immutable backtest spec artifact conflict for {b_hash}")
+    else:
+        _save_json(
+            spec_path,
+            expected_artifact_spec,
+        )
+
+    import polars as pl
+
+    from case_studies.utils.artifact_digest import value_digest
+
+    artifact_values = {
+        "daily_returns.parquet": returns,
+        "trades.parquet": trades,
+        "fills.parquet": fills,
+        "equity.parquet": equity,
+        "portfolio_state.parquet": portfolio_state,
+        "weights.parquet": weights,
+    }
+    for filename, value in artifact_values.items():
+        if value is None:
+            continue
+        frame = value if isinstance(value, pl.DataFrame) else pl.from_pandas(value)
+        path = bt_dir / filename
+        if path.exists() and value_digest(pl.read_parquet(path)) != value_digest(frame):
+            raise ValueError(f"immutable backtest artifact conflict for {b_hash}")
 
     # Save returns
-    if returns is not None:
+    if returns is not None and not (
+        existing_backtest and (bt_dir / "daily_returns.parquet").exists()
+    ):
         _save_parquet(bt_dir / "daily_returns.parquet", returns)
 
     # Save trade log
-    if trades is not None:
+    if trades is not None and not (existing_backtest and (bt_dir / "trades.parquet").exists()):
         _save_parquet(bt_dir / "trades.parquet", trades)
 
     # Save fill-level execution records
-    if fills is not None:
+    if fills is not None and not (existing_backtest and (bt_dir / "fills.parquet").exists()):
         _save_parquet(bt_dir / "fills.parquet", fills)
 
     # Save bar-level equity curve
-    if equity is not None:
+    if equity is not None and not (existing_backtest and (bt_dir / "equity.parquet").exists()):
         _save_parquet(bt_dir / "equity.parquet", equity)
 
     # Save bar-level portfolio state
-    if portfolio_state is not None:
+    if portfolio_state is not None and not (
+        existing_backtest and (bt_dir / "portfolio_state.parquet").exists()
+    ):
         _save_parquet(bt_dir / "portfolio_state.parquet", portfolio_state)
 
     # Save target weights
-    if weights is not None:
+    if weights is not None and not (existing_backtest and (bt_dir / "weights.parquet").exists()):
         _save_parquet(bt_dir / "weights.parquet", weights)
+
+    artifact_digests = {
+        path.name: value_digest(pl.read_parquet(path)) for path in sorted(bt_dir.glob("*.parquet"))
+    }
+    if "daily_returns.parquet" not in artifact_digests:
+        raise ValueError("registered backtest has no daily-returns artifact")
+    artifact_digests_json = canonical_json(artifact_digests)
 
     # Defensive: compute per-backtest uncertainty inline from daily
     # returns when the caller didn't pre-compute it. The canonical
@@ -734,6 +1220,7 @@ def register_backtest_run(
     # estimates without the uncertainty pack.
     needs_uncertainty = returns is not None and (metrics is None or "sharpe_se_lo" not in metrics)
     if needs_uncertainty:
+        assert returns is not None
         from case_studies.utils.uncertainty import (
             compute_backtest_uncertainty,
             periods_per_year_from_setup,
@@ -769,18 +1256,34 @@ def register_backtest_run(
                 n = returns.height if hasattr(returns, "height") else len(returns)
                 metrics["n_periods"] = float(n)
 
-    # Insert into DB — clean child tables first to avoid FK violations
-    # on INSERT OR REPLACE (which is DELETE + INSERT under the hood)
+    # Insert into DB without replacing an existing parent row. Metric UPSERTs
+    # below update only supplied columns and preserve prior headline and fold data.
     db = _open_registry(case_dir)
     try:
-        db.execute("DELETE FROM backtest_fold_metrics WHERE backtest_hash = ?", (b_hash,))
-        db.execute("DELETE FROM backtest_metrics WHERE backtest_hash = ?", (b_hash,))
+        if identity_version in SUPPORTED_IDENTITY_VERSIONS:
+            existing = db.execute(
+                "SELECT prediction_hash, spec_json FROM backtest_runs WHERE backtest_hash = ?",
+                (b_hash,),
+            ).fetchone()
+            if existing is not None:
+                existing_spec = json.loads(existing[1] or "{}")
+                same_identity = canonical_json(
+                    _hashable_strategy_spec(existing_spec)
+                ) == canonical_json(_hashable_strategy_spec(strategy_spec))
+                if existing[0] != prediction_hash or not same_identity:
+                    raise ValueError(f"immutable backtest identity conflict for {b_hash}")
+                stored_digest_json = db.execute(
+                    "SELECT artifact_digests_json FROM backtest_runs WHERE backtest_hash = ?",
+                    (b_hash,),
+                ).fetchone()[0]
+                if stored_digest_json not in (None, artifact_digests_json):
+                    raise ValueError(f"immutable backtest artifact digest conflict for {b_hash}")
         db.execute(
             """
-            INSERT OR REPLACE INTO backtest_runs
+            INSERT OR IGNORE INTO backtest_runs
             (backtest_hash, prediction_hash, spec_json, stage, created_at, git_commit,
-             started_at, elapsed_s)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             started_at, elapsed_s, artifact_digests_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 b_hash,
@@ -791,7 +1294,13 @@ def register_backtest_run(
                 _git_hash(),
                 started_at,
                 elapsed_s,
+                artifact_digests_json,
             ),
+        )
+        db.execute(
+            "UPDATE backtest_runs SET artifact_digests_json = ? "
+            "WHERE backtest_hash = ? AND artifact_digests_json IS NULL",
+            (artifact_digests_json, b_hash),
         )
 
         if metrics:
@@ -909,7 +1418,7 @@ def register_paired_metrics(
         except (TypeError, ValueError):
             return None
 
-    def _i(v: object) -> int | None:
+    def _i(v: Any) -> int | None:
         try:
             return int(v) if v is not None else None
         except (TypeError, ValueError):
@@ -1104,8 +1613,38 @@ def register_causal_run(
     """
     if case_dir is None:
         case_dir = _case_dir(case_study)
+    import json
+
+    version = (json.loads(spec_json) or {}).get("identity_version")
+    immutable = version in SUPPORTED_IDENTITY_VERSIONS
     db = _open_registry(case_dir)
     try:
+        existing = db.execute(
+            "SELECT label, treatment, confounders_json, embargo, n_folds, n_obs, "
+            "dml_effect, dml_se_hac, p_value_hac, naive_effect, confounding_bias_pct, "
+            "refutation_p, spec_json, notebook FROM causal_runs WHERE causal_hash = ?",
+            (causal_hash,),
+        ).fetchone()
+        expected = (
+            label,
+            treatment,
+            confounders_json,
+            embargo,
+            n_folds,
+            n_obs,
+            dml_effect,
+            dml_se_hac,
+            p_value_hac,
+            naive_effect,
+            confounding_bias_pct,
+            refutation_p,
+            spec_json,
+            notebook,
+        )
+        if immutable and existing is not None:
+            if existing != expected:
+                raise ValueError(f"immutable causal result conflict for {causal_hash}")
+            return
         # ON CONFLICT DO UPDATE rather than INSERT OR REPLACE — consistent with
         # register_paired_metrics, avoids the implicit DELETE that triggers
         # FK cascades and loses the original created_at timestamp.

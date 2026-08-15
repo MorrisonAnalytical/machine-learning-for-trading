@@ -12,6 +12,13 @@ from __future__ import annotations
 # torch first ensures its bundled cudart wins the resolution.
 import torch  # noqa: F401
 
+from case_studies.utils.latent_factors.adapter import (
+    LatentFactorContext,
+    reconstruct_locked_request,
+    resolve_model_request,
+    run_resolved_request,
+    validate_locked_run,
+)
 from case_studies.utils.latent_factors.cae import run_cae_fold
 from case_studies.utils.latent_factors.cv import load_fold_extras, run_latent_factor_cv
 from case_studies.utils.latent_factors.ipca import run_ipca_fold
@@ -29,15 +36,20 @@ EXPENSIVE_MODELS = frozenset({"sdf", "cae", "sae"})
 
 __all__ = [
     "EXPENSIVE_MODELS",
+    "LatentFactorContext",
     "compute_managed_portfolios",
     "load_fold_extras",
     "prepare_panel_data",
     "prepare_ragged_panel_data",
     "rank_normalize_cross_section",
+    "reconstruct_locked_request",
     "run_cae_fold",
     "run_ipca_fold",
     "run_latent_factor_cv",
     "run_pca_fold",
     "run_sae_fold",
     "run_sdf_fold",
+    "resolve_model_request",
+    "run_resolved_request",
+    "validate_locked_run",
 ]

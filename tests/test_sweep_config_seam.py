@@ -141,12 +141,25 @@ class TestQuarantinePolicy:
             )
 
 
+def test_crypto_long_short_grid_keeps_only_disjoint_selections() -> None:
+    schemes = get_entry_schemes_for(
+        "crypto_perps_funding",
+        "fwd_ret_8h",
+        n_assets=19,
+        long_short=True,
+    )
+
+    top_k = [scheme["top_k"] for scheme in schemes if scheme["method"] == "equal_weight_top_k"]
+    assert top_k == [5]
+    assert load_sweep("crypto_perps_funding")["top_k_grid"]["fwd_ret_8h"] == [5, 10]
+
+
 # ---------------------------------------------------------------------------
 # Registry reconciliation - declared sweep covers rank-1 per (CS, label)
 # ---------------------------------------------------------------------------
 
 
-def _registry_path(case_study: str) -> Path:
+def registry_path(case_study: str) -> Path:
     return CASE_STUDIES_DIR / case_study / "run_log" / "registry.db"
 
 
@@ -171,7 +184,7 @@ class TestRegistryReconciliation:
 
     @pytest.mark.parametrize("case_study", MIGRATED_CASES)
     def test_rank1_signal_method_in_declared_sweep(self, case_study):
-        reg_path = _registry_path(case_study)
+        reg_path = registry_path(case_study)
         if not reg_path.exists():
             pytest.skip(f"{case_study}: registry.db not present")
 

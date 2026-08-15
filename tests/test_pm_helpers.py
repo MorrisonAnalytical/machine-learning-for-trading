@@ -1,5 +1,7 @@
+import os
 import re
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from tests.pm_helpers import (
     get_reruns,
     get_tier,
     missing_required_env,
+    research_preview_parameters,
     unusable_parameters,
 )
 
@@ -910,3 +913,139 @@ def test_unusable_parameters_keeps_a_class_read_before_its_attribute(tmp_path: P
     )
 
     assert unusable_parameters(py, ["LIMIT"]) == {}
+
+
+class _FakePapermill(types.ModuleType):
+    """Stands in for papermill, which `test-unit` deliberately does not install.
+
+    Both execution paths do `import papermill as pm` inside the function, so a module
+    placed in sys.modules is what they get. Recording os.environ at that moment is
+    exactly what the kernel would inherit.
+    """
+
+    class PapermillExecutionError(Exception):
+        cell_index = 0
+        ename = "x"
+        evalue = "x"
+
+    def __init__(self, seen: dict[str, str | None]) -> None:
+        super().__init__("papermill")
+        self.seen = seen
+
+    def execute_notebook(self, *args, **kwargs) -> None:
+        for name in pm_helpers.KERNEL_THREAD_CAPS:
+            self.seen[name] = os.environ.get(name)
+
+
+def _fake_papermill(monkeypatch) -> dict[str, str | None]:
+    seen: dict[str, str | None] = {}
+    monkeypatch.setitem(sys.modules, "papermill", _FakePapermill(seen))
+    for name in pm_helpers.KERNEL_THREAD_CAPS:
+        monkeypatch.setenv(name, "24")
+    return seen
+
+
+def test_run_notebook_caps_the_kernel_thread_pools(tmp_path: Path, monkeypatch) -> None:
+    """Every pool the kernel can open is pinned before papermill starts it.
+
+    Unpinned, each of scikit-learn, the BLAS and numexpr opens one thread per
+    core, several suites run at once, and the OpenMP pools spin rather than block
+    while they wait. The wall-clock cost lands inside whichever cell is running
+    and is indistinguishable in the log from that cell being slow.
+    """
+    py = tmp_path / "01_demo.py"
+    py.write_text('# %% tags=["parameters"]\nX = 1\n', encoding="utf-8")
+    monkeypatch.setattr(pm_helpers, "sync_notebook", lambda p: py.with_suffix(".ipynb"))
+    seen = _fake_papermill(monkeypatch)
+
+    pm_helpers.run_notebook(py_path=py, timeout=5)
+
+    assert seen == dict.fromkeys(pm_helpers.KERNEL_THREAD_CAPS, pm_helpers.KERNEL_THREAD_CAP)
+    # ...and restored afterwards, so the caps do not leak into the pytest process.
+    assert os.environ["OMP_NUM_THREADS"] == "24"
+
+
+def test_reduced_harness_injects_only_migrated_study_preview_parameters(
+    tmp_path: Path,
+) -> None:
+    migrated = tmp_path / "06_model.py"
+    migrated.write_text(
+        '# %% tags=["parameters"]\n'
+        'EXECUTION_TIER = "canonical"\n'
+        'WORKSPACE = "experiments/unrelated"\n'
+        "MAX_FOLDS = 8\n"
+        "# %%\n"
+        "print(EXECUTION_TIER, WORKSPACE, MAX_FOLDS)\n",
+        encoding="utf-8",
+    )
+    legacy = tmp_path / "05_legacy.py"
+    legacy.write_text(
+        '# %% tags=["parameters"]\nMAX_FOLDS = 8\n# %%\nprint(MAX_FOLDS)\n',
+        encoding="utf-8",
+    )
+    isolated = tmp_path / "isolated"
+
+    migrated_parameters = research_preview_parameters(
+        migrated,
+        {"MAX_FOLDS": 1, "WORKSPACE": "experiments/unrelated"},
+        isolated,
+    )
+    legacy_parameters = research_preview_parameters(legacy, {"MAX_FOLDS": 1}, isolated)
+
+    assert migrated_parameters == {
+        "EXECUTION_TIER": "preview",
+        "MAX_FOLDS": 1,
+        "WORKSPACE": str(isolated.resolve()),
+    }
+    assert legacy_parameters == {"MAX_FOLDS": 1}
+
+
+def test_run_notebook_requires_explicit_research_preview_opt_in(
+    tmp_path: Path, monkeypatch
+) -> None:
+    py = tmp_path / "06_model.py"
+    py.write_text(
+        '# %% tags=["parameters"]\nEXECUTION_TIER = "canonical"\nWORKSPACE = None\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pm_helpers, "sync_notebook", lambda path: path.with_suffix(".ipynb"))
+    _fake_papermill(monkeypatch)
+    calls: list[Path] = []
+
+    def inject(py_path: Path, parameters: dict | None, output_dir: Path | None) -> dict:
+        calls.append(py_path)
+        return dict(parameters or {})
+
+    monkeypatch.setattr(pm_helpers, "research_preview_parameters", inject)
+
+    pm_helpers.run_notebook(py, output_dir=tmp_path / "canonical")
+    assert calls == []
+
+    pm_helpers.run_notebook(
+        py,
+        output_dir=tmp_path / "preview",
+        research_preview=True,
+    )
+    assert calls == [py]
+
+
+def test_notebook_worker_caps_the_same_pools(tmp_path: Path, monkeypatch) -> None:
+    """The full-execution path builds its own env table, so it can drift from
+    run_notebook's. Both read one table, and this is what notices if they stop."""
+    from tests import notebook_worker
+
+    py = tmp_path / "01_demo.py"
+    py.write_text('# %% tags=["parameters"]\nX = 1\n', encoding="utf-8")
+    py.with_suffix(".ipynb").write_text("{}", encoding="utf-8")
+    seen = _fake_papermill(monkeypatch)
+
+    notebook_worker._run_full_notebook(
+        py_path=py,
+        timeout=5,
+        output_dir=None,
+        data_dir=None,
+        extra_env={},
+        sync_policy="never",
+    )
+
+    assert seen == dict.fromkeys(pm_helpers.KERNEL_THREAD_CAPS, pm_helpers.KERNEL_THREAD_CAP)

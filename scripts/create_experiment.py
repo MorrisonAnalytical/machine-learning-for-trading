@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import stat
 import uuid
@@ -23,11 +24,15 @@ def create_experiment(
     output_root: Path,
     *,
     repo_root: Path = REPO_ROOT,
+    manifest: dict | None = None,
+    include_release_run_log: bool = True,
 ) -> Path:
     """Copy available generated state into a new ML4T_OUTPUT_DIR."""
     source = repo_root / "case_studies" / case_study
     source_run_log = source / "run_log"
-    if not source.is_dir() or not source_run_log.is_dir() or source_run_log.is_symlink():
+    if not source.is_dir() or (
+        include_release_run_log and (not source_run_log.is_dir() or source_run_log.is_symlink())
+    ):
         raise ValueError(f"Install the {case_study} artifact bundle before creating an experiment")
     source_config = source / "config"
     if not source_config.is_dir():
@@ -51,6 +56,9 @@ def create_experiment(
     try:
         staging.mkdir()
         for name in GENERATED_DIRS:
+            if name == "run_log" and not include_release_run_log:
+                (staging / name).mkdir()
+                continue
             candidate = source / name
             if candidate.is_dir():
                 shutil.copytree(candidate, staging / name)
@@ -60,6 +68,11 @@ def create_experiment(
         # config reads to ML4T_OUTPUT_DIR, so the experiment must carry its own copy
         # (else notebooks crash on config/setup.yaml before any reader edit is reached).
         shutil.copytree(source_config, staging / "config")
+
+        if manifest is not None:
+            (staging / ".study.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            )
 
         _make_writable(staging)
         release_metadata = staging / "run_log/.release"
