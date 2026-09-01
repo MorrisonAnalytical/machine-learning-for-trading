@@ -16,16 +16,16 @@
 # %% [markdown]
 # # S&P 500 Equity+Options: Portfolio Allocation
 #
-# This notebook advances the ten best primary-label model configurations from
-# the equal-weight baseline and tests five point-in-time allocation methods. It
-# asks whether portfolio sizing improves validation performance without
-# changing the prediction model or consulting the holdout.
+# This notebook advances the highest-ranked primary-label model configurations
+# from the equal-weight baseline and tests the point-in-time allocation methods
+# `setup.yaml` declares. It asks whether portfolio sizing improves validation
+# performance without changing the prediction model or consulting the holdout.
 #
 # **Learning objectives**
 #
 # 1. Apply the top-ten, one-checkpoint-per-configuration selection funnel.
-# 2. Compare score weighting, inverse volatility, risk parity, MVO, and HRP on
-#    the same validation predictions.
+# 2. Compare score weighting, conformal weighting, inverse volatility, risk
+#    parity, MVO and HRP on the same validation predictions.
 # 3. Measure how the number of selected stocks changes allocation performance.
 # 4. Separate a validation improvement from evidence of out-of-sample efficacy.
 #
@@ -33,7 +33,7 @@
 #
 # **Prerequisites:** `14_backtest` and its registry-backed equal-weight
 # baselines. Signals form after Friday's close and execute at the next available
-# open, normally Monday. The 2021 holdout remains sealed throughout. The
+# open, normally Monday. Every result here is validation data. The
 # current-constituent universe retains survivorship bias, so results describe
 # this retrospective roster rather than historical S&P 500 membership or a
 # prospective index population.
@@ -50,6 +50,7 @@ import polars as pl
 
 warnings.filterwarnings("ignore")
 
+from case_studies.research import Study
 from case_studies.utils.backtest_loaders import (
     get_backtest_config,
     load_backtest_prices_for,
@@ -57,6 +58,8 @@ from case_studies.utils.backtest_loaders import (
 )
 from case_studies.utils.backtest_presets import build_backtest_spec
 from case_studies.utils.backtest_runner import run_backtest
+from case_studies.utils.conformal import ensure_conformal_calibration_identity
+from case_studies.utils.notebook_contracts import prediction_members_in_force
 from case_studies.utils.registry import (
     backtest_hash_from_parts,
     read_predictions,
@@ -78,22 +81,44 @@ MAX_SYMBOLS = 0
 SKIP_EXPENSIVE_ALLOC = False
 TOP_N_PREDICTIONS = None
 
+# %% [markdown]
+# ### What is asked for, and what it resolves to
+#
+# The parameters above are the request; the values this notebook runs on are resolved here under
+# different names, so a resolved value can never overwrite the request that produced it. An
+# injected parameter wins; otherwise the case study's own declaration does.
+
 # %%
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 bt_config = get_backtest_config(CASE_STUDY_ID)
-if TOP_N_PREDICTIONS is None:
-    TOP_N_PREDICTIONS = get_top_n_predictions(CASE_STUDY_ID, "allocation")
+TOP_N = (
+    TOP_N_PREDICTIONS
+    if TOP_N_PREDICTIONS is not None
+    else get_top_n_predictions(CASE_STUDY_ID, "allocation")
+)
 CHECKPOINTS_PER_CONFIG = get_checkpoints_per_config(CASE_STUDY_ID)
-if not LABEL:
-    LABEL = bt_config.primary_label
+ALLOCATION_LABEL = LABEL or bt_config.primary_label
 
 print(
-    f"Case study: {CASE_STUDY_ID}; label: {LABEL}; "
-    f"top configs: {TOP_N_PREDICTIONS}; checkpoints/config: {CHECKPOINTS_PER_CONFIG}"
+    f"Case study: {CASE_STUDY_ID}; label: {ALLOCATION_LABEL}; "
+    f"top configs: {TOP_N}; checkpoints/config: {CHECKPOINTS_PER_CONFIG}"
 )
 
+# `Study.at` is the read-only form: one root, no activation. These notebooks only read the
+# populations - their backtests reach the registry by their own paths - and every other way in
+# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` with the
+# canonical tier routes to `Study.regenerate`, which refuses unless `features`, `labels` and
+# `run_log` are symlinks: true in a maintainer worktree, false in every clean clone and CI run.
+# `CASE_DIR` is already the directory this notebook resolved, including under a preview, so
+# asking it directly answers for the registry the rest of the notebook reads.
+_study = Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="15_portfolio_management")
+_members, _population_notes = prediction_members_in_force(_study)
+for _note in _population_notes:
+    print(_note)
+CURRENT_MEMBERS = _members
+
 # %% [markdown]
-# ## 1. Advance the baseline winners
+# ## 1. Advance the leading baselines
 #
 # Selection uses validation Sharpe and counts distinct `(family, config_name)`
 # pairs. Each configuration enters through its best full-coverage checkpoint,
@@ -103,29 +128,28 @@ print(
 # %%
 top_preds = resolve_best_predictions(
     CASE_STUDY_ID,
-    LABEL,
+    ALLOCATION_LABEL,
     split="validation",
     stage="signal",
-    top_n=TOP_N_PREDICTIONS,
+    top_n=TOP_N,
     checkpoints_per_config=CHECKPOINTS_PER_CONFIG,
+    prediction_hashes=CURRENT_MEMBERS,
 )
-if len(top_preds) != TOP_N_PREDICTIONS:
-    raise RuntimeError(
-        f"Expected {TOP_N_PREDICTIONS} advancing configurations, found {len(top_preds)}"
-    )
+if len(top_preds) != TOP_N:
+    raise RuntimeError(f"Expected {TOP_N} advancing configurations, found {len(top_preds)}")
 
 selected_hashes = top_preds["prediction_hash"].to_list()
 top_preds.select("source", "prediction_hash", "sharpe")
 
 # %% [markdown]
-# The primary-label funnel advances NLinear, SDF, CAE, IPCA, LSTM, PatchTST,
-# and four regularized linear configurations. These are the inputs to the
-# allocation comparison, not conclusions from it.
+# The table above is authoritative: each row is one current configuration's
+# best full-coverage checkpoint. These are inputs to the allocation comparison,
+# not conclusions from it.
 
 # %%
 prices = load_backtest_prices_for(
     CASE_STUDY_ID,
-    LABEL,
+    ALLOCATION_LABEL,
     split="validation",
     warmup_periods=warmup_periods_for(CASE_STUDY_ID),
     max_symbols=MAX_SYMBOLS,
@@ -137,11 +161,12 @@ print(f"Price support: {len(prices):,} rows across {n_assets} historical symbols
 # ## 2. Sweep alternative allocators
 #
 # Equal weight is the baseline established in `14_backtest`, so it is not an
-# allocation-stage method. The sweep combines three concentration levels with
-# five alternatives. Existing hashes are reused; only missing combinations run.
+# allocation-stage method. The sweep combines every declared concentration level with every
+# declared alternative allocator, both read from `setup.yaml` rather than counted here, so the
+# grid follows the declaration. Existing hashes are reused; only missing combinations run.
 
 # %%
-TOP_K_VALUES = get_top_k_values_for(CASE_STUDY_ID, LABEL, n_assets)
+TOP_K_VALUES = get_top_k_values_for(CASE_STUDY_ID, ALLOCATION_LABEL, n_assets)
 ALLOC_CONFIGS = get_allocators(CASE_STUDY_ID)
 if SKIP_EXPENSIVE_ALLOC:
     ALLOC_CONFIGS = [
@@ -176,7 +201,11 @@ for pred_row in top_preds.iter_rows(named=True):
                     "long_short": bt_config.long_short,
                 },
                 allocation={**alloc, "top_k": top_k, "long_short": bt_config.long_short},
+                label=ALLOCATION_LABEL,
             )
+            # run_backtest resolves the conformal calibration identity into the spec
+            # before registering, so hash the resolved spec or the cache never hits.
+            spec = ensure_conformal_calibration_identity(spec)
             planned.append(
                 {
                     "prediction_hash": pred_row["prediction_hash"],
@@ -211,7 +240,7 @@ for index, row in enumerate(planned, start=1):
             row["spec"],
             prices=prices,
             predictions=read_predictions(CASE_STUDY_ID, row["prediction_hash"]),
-            label=LABEL,
+            label=ALLOCATION_LABEL,
             register=True,
             initial_cash=bt_config.initial_cash,
             calendar=bt_config.calendar,
@@ -241,28 +270,34 @@ from case_studies.utils.backtest_explorer import BacktestExplorer
 
 explorer = BacktestExplorer(CASE_STUDY_ID)
 alloc_comparison = explorer.compare_allocators(
-    label=LABEL,
+    label=ALLOCATION_LABEL,
     prediction_hashes=selected_hashes,
 ).filter(pl.col("allocator").is_in(allocation_methods))
 alloc_comparison
 
 # %% [markdown]
-# Risk parity has the strongest average Sharpe across the 30
-# prediction-by-concentration combinations. Score weighting is less consistent
-# on average but produces the highest individual allocation result.
+# The table pairs each allocator's mean Sharpe across its prediction-by-concentration
+# combinations with its single strongest one. Read the pair, not either column alone:
+# an allocator can lead on the mean while another owns the peak, and a mean over a
+# handful of combinations moves on one of them.
 
 # %%
 plot_alloc = alloc_comparison.sort("avg_sharpe")
 fig, ax = plt.subplots(figsize=FIGSIZE["single"], constrained_layout=True)
 y = range(len(plot_alloc))
-allocator_labels = {
-    "score_weighted": "Score weighted",
+_ALLOCATOR_NAMES = {
     "inverse_vol": "Inverse volatility",
-    "risk_parity": "Risk parity",
     "mvo_ledoit_wolf": "MVO (Ledoit-Wolf)",
     "hrp": "HRP",
 }
-labels = [allocator_labels[name] for name in plot_alloc["allocator"].to_list()]
+
+
+def allocator_label(method: str) -> str:
+    """Chart label for an allocator declared in `setup.yaml`."""
+    return _ALLOCATOR_NAMES.get(method, method.replace("_", " ").capitalize())
+
+
+labels = [allocator_label(name) for name in plot_alloc["allocator"].to_list()]
 ax.barh(y, plot_alloc["avg_sharpe"], color=COLORS["blue"], alpha=0.82, label="Mean")
 ax.scatter(plot_alloc["best_sharpe"], y, color=COLORS["amber"], s=48, zorder=3, label="Best")
 ax.set_yticks(list(y), labels)
@@ -270,23 +305,25 @@ ax.set_xlabel("Annualized validation Sharpe")
 ax.legend(frameon=False, loc="lower right")
 add_message_title(
     ax,
-    "Risk parity leads on average; score weighting owns the peak",
-    "Thirty primary-label combinations per alternative allocator",
+    "Mean and peak Sharpe for each declared allocator",
+    "Bars: mean across primary-label combinations; points: strongest single one",
 )
 fig.show()
 
 # %% [markdown]
-# ## 4. Inspect the allocation winner
+# ## 4. Inspect the leading allocation
 #
-# The best allocation combines NLinear predictions, ten selected stocks, and
-# score weighting. The table keeps the top ten visible while the next figure
-# shows whether that result depends on one concentration choice.
+# The table keeps the highest-Sharpe rows visible, and the figure after it shows whether that
+# result depends on one concentration choice. **Read the two together.** A row that leads at one
+# `top_k` and disappears at the next is a concentration artefact rather than an allocator that
+# suits this signal, and the sweep runs every level precisely so that is visible rather than
+# assumed.
 
 # %%
 top_rows = explorer.best(
     stage="allocation",
     top_n=10,
-    label=LABEL,
+    label=ALLOCATION_LABEL,
     prediction_hashes=selected_hashes,
 )
 winner = explorer.inspect(top_rows["backtest_hash"][0])
@@ -297,17 +334,22 @@ baseline_sharpe = top_preds.filter(pl.col("prediction_hash") == winner.predictio
 allocation_delta = winner.metrics["sharpe"] - baseline_sharpe
 
 print(
-    f"Winner: {winner.source}; allocator={winner_allocator}; top_k={winner_top_k}; "
-    f"Sharpe={winner.metrics['sharpe']:.3f} "
-    f"[{winner.metrics['sharpe_ci95_lo']:.3f}, {winner.metrics['sharpe_ci95_hi']:.3f}]"
+    f"Selected allocation: {winner.source}; allocator={winner_allocator}; "
+    f"top_k={winner_top_k}; validation Sharpe={winner.metrics['sharpe']:.3f}"
 )
 print(f"Equal-weight baseline={baseline_sharpe:.3f}; allocation delta={allocation_delta:+.3f}")
 top_rows.select("source", "prediction_hash", "sharpe", "cagr", "max_drawdown")
 
 # %% [markdown]
-# Five or ten selected stocks preserve NLinear's allocation edge across the
-# eligible alternatives. Expanding to twenty names lowers Sharpe for every
-# allocator, which is consistent with dilution of the cross-sectional ranking.
+# The point estimate is conditional on selecting this row from the full allocation sweep. An
+# ordinary interval for this one return path would omit that search, so it is not reported as
+# uncertainty about the selected allocation.
+
+# %% [markdown]
+# The curve below asks whether the allocation result depends on how many names are
+# held. A Sharpe that falls as the basket widens is what dilution of the
+# cross-sectional ranking looks like; one that is flat says the allocator, not the
+# concentration, is doing the work.
 
 # %%
 winner_curve = explorer.concentration_curve(winner.prediction_hash).filter(
@@ -331,7 +373,7 @@ for color, method in zip(palette, allocation_methods, strict=True):
         marker="o",
         linewidth=1.8,
         color=color,
-        label=allocator_labels[method],
+        label=allocator_label(method),
     )
 ax.axhline(baseline_sharpe, color=COLORS["neutral"], linestyle="--", linewidth=1.2)
 ax.set_xticks(TOP_K_VALUES)
@@ -346,7 +388,7 @@ ax.legend(
 )
 add_message_title(
     ax,
-    "Most allocators preserve NLinear's edge at five to ten names",
+    "How each allocator's Sharpe moves as the basket widens",
     f"Dashed line: equal-weight baseline Sharpe {baseline_sharpe:.3f}",
 )
 fig.show()
@@ -354,17 +396,28 @@ fig.show()
 # %% [markdown]
 # ## Key takeaways
 #
-# 1. The allocation funnel advances ten distinct full-coverage configurations;
-#    the 2021 holdout is not consulted.
-# 2. Risk parity leads the method averages at validation Sharpe 0.639. Score
-#    weighting produces the peak result: NLinear, top 10, Sharpe 1.186 with a
-#    block-bootstrap interval of [0.032, 2.426].
-# 3. Allocation raises the winning NLinear lineage from an equal-weight baseline
-#    Sharpe of 0.826 to 1.186, a validation improvement of 0.360.
-# 4. Twenty-name portfolios dilute the NLinear result across all five eligible
-#    alternatives.
-# 5. These are selection-stage results on a current-constituent universe, so
-#    they retain survivorship bias and do not establish an out-of-sample edge.
+# 1. **Equal weight is the baseline, not a competitor.** It is the signal stage's own weighting,
+#    so it is excluded from the allocator menu and the notebook raises if it reappears there.
+#    Every Sharpe here is read against it rather than ranked alongside it.
 #
-# **Next:** `16_costs` applies realistic friction assumptions to the best
-# validation lineage. See Chapter 18 for the transaction-cost framework.
+# 2. **An allocator is judged across concentration levels, not at one.** The method averages and
+#    the per-`top_k` figure answer different questions: which allocator suits this signal on
+#    average, and whether its leading row persists when the number of names held changes.
+#
+# 3. **The gain from allocation is measured against that lineage's own baseline.** The
+#    difference between a lineage's equal-weight Sharpe and its highest allocated Sharpe is
+#    what allocation contributed. That comparison holds the predictions fixed, which is what
+#    isolates the allocator's effect from the signal's.
+#
+# 4. **The declared allocators read three different things.** Score weighting reads the
+#    point prediction, `conformal_weighted` reads the width of its interval, and inverse
+#    volatility, risk parity, MVO and HRP weight by a moment of returns. Where the conformal
+#    intervals under-cover out of time - which `13_model_analysis` measures - only the
+#    interval-width allocator inherits that miscalibration, so read its result beside that
+#    coverage rather than on its own.
+#
+# 5. **These are selection-stage results on a current-constituent universe**, so they carry
+#    survivorship bias and establish no out-of-sample edge. The holdout is untouched here.
+#
+# **Next:** [`16_risk_management`](16_risk_management.ipynb) applies friction to the leading validation lineage. See
+# Chapter 18 for the transaction-cost framework.
